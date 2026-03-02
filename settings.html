@@ -890,6 +890,7 @@
             const shieldItem = shieldInput?.closest('.switch-item');
             if (!responsive || !shieldInput) return;
             const enabled = responsive.checked;
+            if (!enabled) shieldInput.checked = false;
             shieldInput.disabled = !enabled;
             shieldItem?.classList.toggle('switch-disabled', !enabled);
         }
