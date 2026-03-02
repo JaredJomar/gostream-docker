@@ -14,7 +14,7 @@ import (
 
 type BTSets struct {
 	// Cache
-	CacheSize       int64 // in byte, def 64 MB
+	CacheSize       int64 // in byte, def 128 MB
 	ReaderReadAHead int   // in percent, 5%-100%, [...S__X__E...] [S-E] not clean
 	PreloadCache    int   // in percent
 
@@ -78,7 +78,7 @@ func SetBTSets(sets *BTSets) {
 	}
 	// failsafe checks (use defaults)
 	if sets.CacheSize == 0 {
-		sets.CacheSize = 64 * 1024 * 1024
+		sets.CacheSize = 128 * 1024 * 1024
 	}
 	if sets.ConnectionsLimit == 0 {
 		sets.ConnectionsLimit = 25
@@ -148,12 +148,12 @@ func SetDefaultConfig() {
 	defer btsetsMu.Unlock()
 
 	sets := new(BTSets)
-	sets.CacheSize = 64 * 1024 * 1024 // 64 MB (Verified Optimal)
+	sets.CacheSize = 128 * 1024 * 1024 // 128 MB
 	sets.PreloadCache = 0
 	sets.ConnectionsLimit = 25 // CRITICAL: Do not increase for Pi 4
 	sets.RetrackersMode = 1
 	sets.TorrentDisconnectTimeout = 30
-	sets.ReaderReadAHead = 50 // 50%
+	sets.ReaderReadAHead = 75 // 75%
 	sets.ResponsiveMode = true
 	sets.ShowFSActiveTorr = true
 	sets.StoreSettingsInJson = true
@@ -200,12 +200,12 @@ func loadBTSets() {
 	// initialize defaults on error
 	// Inline SetDefaultConfig logic to avoid double locking or use an unexported function
 	sets := new(BTSets)
-	sets.CacheSize = 64 * 1024 * 1024 // 64 MB
+	sets.CacheSize = 128 * 1024 * 1024 // 128 MB
 	sets.PreloadCache = 0
 	sets.ConnectionsLimit = 25
 	sets.RetrackersMode = 1
 	sets.TorrentDisconnectTimeout = 30
-	sets.ReaderReadAHead = 50 // 50%
+	sets.ReaderReadAHead = 75 // 75%
 	sets.ResponsiveMode = true
 	sets.ShowFSActiveTorr = true
 	sets.StoreSettingsInJson = true

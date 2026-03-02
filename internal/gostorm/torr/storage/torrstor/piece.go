@@ -78,6 +78,15 @@ func (p *Piece) MarkComplete() error {
 func (p *Piece) MarkNotComplete() error {
 	p.Complete = false
 
+	// V-evict-guard: buffer nil = pezzo evicted dalla cache, non corruzione da peer.
+	// Evita falsi positivi AdaptiveShield durante eviction sotto pressione RAM.
+	p.mPiece.mu.RLock()
+	hasData := p.mPiece.buffer != nil
+	p.mPiece.mu.RUnlock()
+	if !hasData {
+		return nil
+	}
+
 	// V303: Adaptive Responsive Shield
 	// Corruption detected: update last seen Unix timestamp
 	now := time.Now().Unix()
@@ -97,9 +106,9 @@ func (p *Piece) MarkNotComplete() error {
 				last := lastCorruptionUnix.Load()
 				elapsed := time.Since(time.Unix(last, 0))
 
-				if elapsed > 3*time.Second {
+				if elapsed > 60*time.Second {
 					if shieldActive.Swap(false) {
-						log.TLogln("[AdaptiveShield] Clean streak detected (3s) - Restoring FAST mode (Shield: OFF)")
+						log.TLogln("[AdaptiveShield] Clean streak detected (60s) - Restoring FAST mode (Shield: OFF)")
 					}
 					isWatchdogRunning.Store(false)
 					return
