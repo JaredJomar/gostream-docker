@@ -69,9 +69,9 @@ TV series work the same way: a weekly script finds new seasons and episodes, org
 
 You can also add a title to your **Plex Watchlist** from any device and it will appear in your library within the hour.
 
-### Why this beats Stremio
+### 100% local, no subscriptions
 
-Stremio routes your playback through external services (Real-Debrid, Torrentio): your data leaves your home, you depend on third-party availability, and you pay a subscription. GoStream is 100% local. There is no external dependency at playback time, no monthly fee, and your library never disappears because a service went down.
+GoStream has no external dependency at playback time. No third-party service, no monthly fee, no data leaving your home. Your library is always available, even without an internet connection, and it never disappears because a remote service went down.
 
 ### Why Infuse starts in under a second
 
