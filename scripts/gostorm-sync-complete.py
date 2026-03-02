@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GoStorm Movies Sync Script - Movies Only (TV Logic Disabled)
-TMDB -> Stremio -> GoStorm integration for Movies
+TMDB  -> GoStorm integration for Movies
 TV Series processing moved to separate script: gostorm-tv-sync.py
 """
 
@@ -36,11 +36,11 @@ def _load_gostream_config() -> dict:
     except Exception:
         cfg = {}
     # Derive auxiliary dirs from install layout:
-    # GoStream/config.json → parent = GoStream dir → parent = base dir
+    # GoStream/config.json → GoStream dir is the base dir for STATE
+    # logs stay at parent level (shared with gostream binary and health-monitor)
     config_dir = os.path.dirname(os.path.abspath(config_path))
-    base_dir = os.path.dirname(config_dir)
-    cfg.setdefault('_state_dir', os.path.join(base_dir, 'STATE'))
-    cfg.setdefault('_log_dir', os.path.join(base_dir, 'logs'))
+    cfg.setdefault('_state_dir', os.path.join(config_dir, 'STATE'))
+    cfg.setdefault('_log_dir', os.path.join(os.path.dirname(config_dir), 'logs'))
     return cfg
 
 

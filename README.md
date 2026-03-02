@@ -283,7 +283,7 @@ The interactive installer handles everything end-to-end:
 2. Prompts for all required paths, Plex credentials, TMDB key, and NAT-PMP settings
 3. Generates `config.json` from `config.json.example`
 4. Installs Python dependencies from `requirements.txt`
-5. Creates `STATE/`, `logs/`, and FUSE mount point directories
+5. Creates `GoStream/STATE/`, `logs/`, and FUSE mount point directories
 6. **Compiles the GoStream binary** (downloads Go if needed, detects architecture automatically)
 7. Writes and enables systemd services for `gostream` and `health-monitor`
 8. Optionally configures cron jobs for sync scripts
@@ -945,7 +945,7 @@ Paths below use the defaults set by `install.sh`. All are configurable during in
 | `~/GoStream/gostream` | Production binary |
 | `~/GoStream/config.json` | Live configuration (edit → `sudo systemctl restart gostream`) |
 | `~/GoStream/scripts/` | Python sync & monitor scripts |
-| `~/STATE/` | Inode map (sibling of install dir) |
+| `~/GoStream/STATE/` | Inode map, sync caches (co-located with install dir) |
 | `~/logs/gostream.log` | Main service log |
 | `/mnt/gostream-mkv-virtual/` | FUSE mount point (served to Plex / Samba) |
 | `/etc/systemd/system/gostream.service` | systemd service definition |
