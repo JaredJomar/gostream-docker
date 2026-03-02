@@ -278,13 +278,14 @@ func RemTorrent(hashHex string) {
 	if bts.RemoveTorrent(hash) {
 		if sets.BTsets.UseDisk && hashHex != "" && hashHex != "/" {
 			name := filepath.Join(sets.BTsets.TorrentsSavePath, hashHex)
-			ff, _ := os.ReadDir(name)
-			for _, f := range ff {
-				os.Remove(filepath.Join(name, f.Name()))
-			}
-			err := os.Remove(name)
-			if err != nil {
-				log.TLogln("Error remove cache:", err)
+			if _, err := os.Stat(name); err == nil {
+				ff, _ := os.ReadDir(name)
+				for _, f := range ff {
+					os.Remove(filepath.Join(name, f.Name()))
+				}
+				if err := os.Remove(name); err != nil {
+					log.TLogln("Error remove cache:", err)
+				}
 			}
 		}
 	}
