@@ -313,6 +313,11 @@
             border-color: var(--border);
         }
 
+        .switch-disabled {
+            opacity: 0.4;
+            pointer-events: none;
+        }
+
         .switch {
             position: relative;
             display: inline-block;
@@ -812,7 +817,7 @@
                                         <div><span>Smart Responsive Mode</span>
                                             <div class="hint">Enables FAST mode: serves data without waiting for full piece verification.
                                                 Pair with Adaptive Shield to auto-protect against corruption.</div>
-                                        </div><label class="switch"><input type="checkbox" name="responsiveMode"><span
+                                        </div><label class="switch"><input type="checkbox" name="responsiveMode" onchange="updateAdaptiveShieldState()"><span
                                                 class="slider"></span></label>
                                     </div>
 
@@ -876,6 +881,17 @@
                 ? 'Peer port managed by NAT-PMP when enabled'
                 : 'Peer port (0 = random)';
             portHint.style.color = enabled ? '#b45309' : '';
+        }
+
+        // --- Adaptive Shield state (disabled when ResponsiveMode is OFF) ---
+        function updateAdaptiveShieldState() {
+            const responsive = document.querySelector('[name="responsiveMode"]');
+            const shieldInput = document.querySelector('[name="adaptiveShield"]');
+            const shieldItem = shieldInput?.closest('.switch-item');
+            if (!responsive || !shieldInput) return;
+            const enabled = responsive.checked;
+            shieldInput.disabled = !enabled;
+            shieldItem?.classList.toggle('switch-disabled', !enabled);
         }
 
         // --- Theme (OS auto-detect + manual override) ---
@@ -1056,6 +1072,7 @@
                     const input = form.querySelector(`[name="${formKey}"]`);
                     if (input) input.checked = NEGATIVE_KEYS.includes(k) ? !originalCore[k] : originalCore[k];
                 });
+                updateAdaptiveShieldState();
                 // Trigger warnings after load
                 document.querySelectorAll('[data-warn-below], [data-warn-above]').forEach(i => i.dispatchEvent(new Event('input')));
             } catch (e) { console.error("Core load error", e); }
