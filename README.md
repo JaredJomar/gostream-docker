@@ -122,7 +122,7 @@ On a standard virtual filesystem, these IDs are random and change every time the
 - [Docker](#docker)
 - [API Reference](#api-quick-reference)
 - [Troubleshooting](#troubleshooting)
-- [Support](#support)
+- [Donate](#support)
 - [License](#license)
 
 ---
