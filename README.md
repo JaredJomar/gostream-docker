@@ -122,6 +122,7 @@ On a standard virtual filesystem, these IDs are random and change every time the
 - [Docker](#docker)
 - [API Reference](#api-quick-reference)
 - [Troubleshooting](#troubleshooting)
+- [Support](#support)
 - [License](#license)
 
 ---
@@ -1013,6 +1014,14 @@ Paths below use the defaults set by `install.sh`. All are configurable during in
 |------|---------|
 | `~/gostream/` | Git clone & build directory |
 | `~/gostream/default.pgo` | PGO profile — regenerate after major code changes |
+
+---
+
+## Support
+
+**DONATE**: GoStream is free and open source. If it's saving you a monthly chip, consider fueling the engine!
+
+<iframe src="https://github.com/sponsors/MrRobotoGit/button" title="Sponsor MrRobotoGit" height="32" width="114" style="border: 0; border-radius: 6px;"></iframe>
 
 ---
 
