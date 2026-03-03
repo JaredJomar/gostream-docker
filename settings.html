@@ -1059,8 +1059,6 @@
                 form.querySelector('[data-for="cacheSize"]').textContent = csVal + ' MB';
                 form.querySelector('[name="readerReadAHead"]').value = originalCore.ReaderReadAHead;
                 form.querySelector('[data-for="readerReadAHead"]').textContent = originalCore.ReaderReadAHead + '%';
-                form.querySelector('[name="preloadCache"]').value = originalCore.PreloadCache;
-                form.querySelector('[data-for="preloadCache"]').textContent = originalCore.PreloadCache + '%';
                 form.querySelector('[name="downloadRateLimit"]').value = originalCore.DownloadRateLimit ? Math.round(originalCore.DownloadRateLimit / 1024) : '';
                 form.querySelector('[name="uploadRateLimit"]').value = originalCore.UploadRateLimit ? Math.round(originalCore.UploadRateLimit / 1024) : '';
                 form.querySelector('[name="connectionsLimit"]').value = originalCore.ConnectionsLimit;
@@ -1087,7 +1085,6 @@
             const sets = { ...originalCore };
             sets.CacheSize = parseInt(formData.get('cacheSize')) * 1024 * 1024;
             sets.ReaderReadAHead = parseInt(formData.get('readerReadAHead'));
-            sets.PreloadCache = parseInt(formData.get('preloadCache'));
             sets.DownloadRateLimit = (parseInt(formData.get('downloadRateLimit')) || 0) * 1024;
             sets.UploadRateLimit = (parseInt(formData.get('uploadRateLimit')) || 0) * 1024;
             sets.ConnectionsLimit = parseInt(formData.get('connectionsLimit'));
