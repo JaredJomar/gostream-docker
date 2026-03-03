@@ -1433,7 +1433,8 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 	budget := int64(globalConfig.ReadAheadBudget)
 	if h.nativeReader != nil && !isTailProbe && (off > prevOff+budget || (prevOff > off+budget && prevOff > 0)) {
 		h.nativeReader.Interrupt()
-		logger.Printf("[V286] Interrupt pump for seek: %dMB → %dMB",
+		torrstor.ResetShield()
+		logger.Printf("[V286] Interrupt pump for seek+shield reset: %dMB → %dMB",
 			prevOff/(1024*1024), off/(1024*1024))
 	}
 
