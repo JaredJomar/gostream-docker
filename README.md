@@ -1021,7 +1021,7 @@ Paths below use the defaults set by `install.sh`. All are configurable during in
 
 **DONATE**: GoStream is free and open source. If it's saving you a monthly chip, consider fueling the engine!
 
-<iframe src="https://github.com/sponsors/MrRobotoGit/button" title="Sponsor MrRobotoGit" height="32" width="114" style="border: 0; border-radius: 6px;"></iframe>
+[![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8ebb)](https://github.com/sponsors/MrRobotoGit)
 
 ---
 
