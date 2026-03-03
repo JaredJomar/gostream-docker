@@ -1019,7 +1019,7 @@ Paths below use the defaults set by `install.sh`. All are configurable during in
 
 ## Support
 
-**DONATE**: GoStream is free and open source. If it's saving you a monthly chip, consider fueling the engine!
+GoStream is free and open source. If it's saving you a monthly chip, consider fueling the engine!
 
 [![](https://img.shields.io/static/v1?label=DONATE!&message=%E2%9D%A4&logo=GitHub&color=%23fe8ebb)](https://github.com/sponsors/MrRobotoGit)
 
