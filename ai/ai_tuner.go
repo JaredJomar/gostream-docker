@@ -205,7 +205,7 @@ func runTuningCycle(aiURL string) {
 func fetchAIJSON[T any](url string, prompt string) (*T, error) {
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"prompt": prompt, "n_predict": 32, "temperature": 0.0,
-		"stop": []string{"<|im_end|>", "}"},
+		"stop": []string{"<|im_end|>", "}", "\n"},
 	})
 	client := &http.Client{Timeout: 45 * time.Second}
 	resp, err := client.Post(url+"/completion", "application/json", bytes.NewBuffer(reqBody))
@@ -223,13 +223,21 @@ func fetchAIJSON[T any](url string, prompt string) (*T, error) {
 		return nil, fmt.Errorf("empty AI response")
 	}
 
-	content := "{\"connections_limit\":" + trimmed
-	if !strings.HasSuffix(content, "}") { content = content + "}" }
+	// Ensure we have at least some JSON content
+	if !strings.Contains(trimmed, ":") && !strings.Contains(trimmed, ",") {
+		return nil, fmt.Errorf("malformed AI response (no key-value): %s", trimmed)
+	}
 
-	// V1.6.19: Surgical replacement of units to avoid corrupting JSON keys (like connections_limit)
+	content := "{\"connections_limit\":" + trimmed
+	// V1.6.21: Robust JSON closure and sanitization
+	if !strings.Contains(content, "}") { content = content + "}" }
+	if strings.Count(content, "{") > strings.Count(content, "}") { content = content + "}" }
+	
+	// Surgical replacement of units to avoid corrupting JSON keys
 	content = strings.ReplaceAll(content, "%", "")
 	content = strings.ReplaceAll(content, "s,", ",")
 	content = strings.ReplaceAll(content, "s}", "}")
+	content = strings.ReplaceAll(content, "s\"", "\"") // Handle cases like "15s" -> "15"
 
 	var result T
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
