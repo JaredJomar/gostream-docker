@@ -1,5 +1,23 @@
 # AI GoStream Pilot Overview [Experimental]
 
+> ### Author’s Note – Why This Is Interesting
+>
+> This project explores a non-traditional application of AI: using a locally quantized Large Language Model (LLM) as a real-time policy engine to dynamically optimize BitTorrent runtime parameters during media streaming.
+>
+> Traditional torrent clients rely on static configuration or deterministic heuristics to manage peer connections, timeouts, and bandwidth behavior. In contrast, GoStream’s AI Pilot periodically analyzes live system metrics (CPU load, buffer state, peer count, throughput, contextual usage scenario) and adapts operational parameters in real time.
+>
+> What makes this approach interesting is not the use of AI for content generation, but the use of a lightweight LLM as a decision layer inside a constrained edge environment (e.g., Raspberry Pi), controlling a distributed P2P network workload under streaming conditions (including 4K media). The model operates with a reduced context window and low resource footprint, demonstrating that adaptive AI-driven control loops can function on minimal hardware without cloud dependency.
+>
+> This experiment reframes an LLM from a conversational tool into a runtime optimization component effectively acting as a soft, contextual control system layered on top of a torrent engine.
+>
+> While experimental, this approach opens discussion around AI-assisted network tuning, adaptive peer management, and lightweight autonomous optimization in decentralized systems.
+>
+> Author: **Matteo Rancilio**
+>
+> 
+
+
+
 **AI GoStream Pilot** is an **optional** autonomous optimization engine designed for GoStream on Raspberry Pi 4. It leverages a tiny local LLM (Qwen2.5-0.5B) to dynamically tune BitTorrent parameters, achieving two critical goals:
 
 ## Optional Activation
