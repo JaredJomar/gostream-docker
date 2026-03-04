@@ -71,13 +71,13 @@ Below are examples of how the AI Pilot behaves during a typical streaming sessio
 The AI analyzes performance every 60s and adjusts parameters only when necessary:
 ```text
 // AI boosts connections to find more peers for a slow torrent
-2026/03/04 11:39:46 [AI-Pilot] Optimizer applying change: Conns(15->35) Timeout(25s->25s) [Metrics: [CPU:30%, Buf:96%, Peers:2, Speed:1.2MB/s] (AVG 60s)]
+2026/03/04 11:39:46 [AI-Pilot] Optimizer applying change: Conns(15->35) Timeout(15s->15s) [Metrics: [CPU:30%, Buf:96%, Peers:2, Speed:1.2MB/s] (AVG 60s)]
 
 // AI scales back resources when speed is sufficient to protect CPU
-2026/03/04 11:44:58 [AI-Pilot] Optimizer applying change: Conns(35->15) Timeout(25s->25s) [Metrics: [CPU:36%, Buf:101%, Peers:4, Speed:11.0MB/s] (AVG 60s)]
+2026/03/04 11:44:58 [AI-Pilot] Optimizer applying change: Conns(35->15) Timeout(15s->25s) [Metrics: [CPU:36%, Buf:101%, Peers:10, Speed:11.0MB/s] (AVG 60s)]
 
 // AI fine-tunes timeout to cycle peers more effectively
-2026/03/04 11:40:56 [AI-Pilot] Optimizer applying change: Conns(35->27) Timeout(25s->60s) [Metrics: [CPU:27%, Buf:98%, Peers:2, Speed:1.8MB/s] (AVG 60s)]
+2026/03/04 12:03:56 [AI-Pilot] Optimizer applying change: Conns(35->27) Timeout(25s->60s) [Metrics: [CPU:27%, Buf:98%, Peers:2, Speed:1.8MB/s] (AVG 60s)]
 ```
 
 ### 3. Stability Confirmation (Pulse)
