@@ -13,31 +13,56 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gostream/internal/gostorm/settings"
 	"gostream/internal/gostorm/torr"
+	"gostream/internal/gostorm/torr/state"
 )
 
 var lastConns = 30
 var lastTimeout = 30
 var metricsHistory []string
 var lastKnownTotalSpeed float64
-var CurrentLimit int32 // V1.6.1: Exported for main package consumption
+var CurrentLimit int32
+
+// V1.6.17: Rolling averages (60s window, 6 samples every 10s)
+var torrentSpeedAvg []float64
+var totalSpeedAvg []float64
+var cpuUsageAvg []float64
+var cycleCounter int
 
 type AITweak struct {
-	ConnectionsLimit int    `json:"connections_limit"`
-	PeerTimeout      int    `json:"peer_timeout"`
+	ConnectionsLimit int `json:"connections_limit"`
+	PeerTimeout      int `json:"peer_timeout"`
 }
 
 func (t *AITweak) Sanitize() {
 	if t.ConnectionsLimit < 15 { t.ConnectionsLimit = 15 }
 	if t.ConnectionsLimit > 60 { t.ConnectionsLimit = 60 }
-	if t.PeerTimeout < 10 { t.PeerTimeout = 10 }
+	if t.PeerTimeout < 15 { t.PeerTimeout = 15 }
 	if t.PeerTimeout > 60 { t.PeerTimeout = 60 }
+}
+
+func getAverage(samples []float64) float64 {
+	if len(samples) == 0 { return 0 }
+	var sum float64
+	for _, v := range samples { sum += v }
+	return sum / float64(len(samples))
 }
 
 func StartAITuner(ctx context.Context, aiURL string) {
 	if aiURL == "" { aiURL = "http://localhost:8085" }
-	log.Printf("[AI-Pilot] Neural optimizer starting... (Targeting 4K Fiber Stability)")
-	ticker := time.NewTicker(60 * time.Second)
+	
+	log.Printf("[AI-Pilot] Initializing... waiting for system settings.")
+	for i := 0; i < 30; i++ {
+		if settings.BTsets != nil && settings.BTsets.TorrentDisconnectTimeout > 0 {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	log.Printf("[AI-Pilot] Neural optimizer starting... (Stats: 5s, AI: 60s)")
+	// V1.6.18: High resolution stats at 5s
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -50,15 +75,22 @@ func StartAITuner(ctx context.Context, aiURL string) {
 	}
 }
 
+var pulseCounter int
+
 func runTuningCycle(aiURL string) {
 	activeTorrents := torr.ListActiveTorrent()
 	if len(activeTorrents) == 0 { 
 		lastKnownTotalSpeed = 0
+		torrentSpeedAvg = nil
+		totalSpeedAvg = nil
+		cpuUsageAvg = nil
+		cycleCounter = 0
 		return 
 	}
 
 	var activeT *torr.Torrent
-	var totalSpeed float64
+	var activeStats *state.TorrentStatus
+	var totalSpeedRaw float64
 	realActiveCount := 0
 	maxSpeed := float64(-1)
 	
@@ -66,51 +98,78 @@ func runTuningCycle(aiURL string) {
 		if t.Torrent == nil { continue }
 		st := t.StatHighFreq()
 		realActiveCount++
-		totalSpeed += st.DownloadSpeed
+		totalSpeedRaw += st.DownloadSpeed
 		if st.DownloadSpeed > maxSpeed {
 			maxSpeed = st.DownloadSpeed
 			activeT = t
+			activeStats = st
 		}
 	}
-	if activeT == nil { 
-		lastKnownTotalSpeed = 0
+
+	if activeT == nil || activeStats == nil { return }
+
+	// 1. COLLECT SAMPLES (Every 5s from Ticker)
+	currSpeedMBs := activeStats.DownloadSpeed / (1024 * 1024)
+	totalSpeedMBs := totalSpeedRaw / (1024 * 1024)
+	currentCPU := float64(getCPUUsage())
+
+	torrentSpeedAvg = append(torrentSpeedAvg, currSpeedMBs)
+	if len(torrentSpeedAvg) > 12 { torrentSpeedAvg = torrentSpeedAvg[1:] }
+	
+	totalSpeedAvg = append(totalSpeedAvg, totalSpeedMBs)
+	if len(totalSpeedAvg) > 12 { totalSpeedAvg = totalSpeedAvg[1:] }
+
+	cpuUsageAvg = append(cpuUsageAvg, currentCPU)
+	if len(cpuUsageAvg) > 12 { cpuUsageAvg = cpuUsageAvg[1:] }
+
+	lastKnownTotalSpeed = totalSpeedMBs
+
+	// 2. AI THROTTLING: Only run inference every 12 samples (60s)
+	cycleCounter++
+	if cycleCounter < 12 {
 		return 
 	}
+	cycleCounter = 0
 
-	lastKnownTotalSpeed = totalSpeed / (1024 * 1024)
-	st := activeT.StatHighFreq()
-	cpu := getCPUUsage()
+	// --- AI INFERENCE BLOCK (Every 60s) ---
+
+	avgTorrentSpeed := getAverage(torrentSpeedAvg)
+	avgTotalSpeed := getAverage(totalSpeedAvg)
+	avgCPU := getAverage(cpuUsageAvg)
+
 	buffer := 100
-	isStaleBuffer := (st.DownloadSpeed / (1024 * 1024)) < 0.1
-
 	if activeT.GetCache() != nil {
 		cs := activeT.GetCache().GetState()
 		if cs.Capacity > 0 { buffer = int(cs.Filled * 100 / cs.Capacity) }
 	}
 
-	fSize := activeT.Size
-	if fSize == 0 { fSize = activeT.Torrent.Length() }
-	fileSizeGB := float64(fSize) / (1024 * 1024 * 1024)
-	
-	currentSnap := fmt.Sprintf("[CPU:%d%%, Buf:%d%%, Peers:%d, Speed:%.1fMB/s]", 
-		cpu, buffer, st.ActivePeers, st.DownloadSpeed/(1024*1024))
+	currentSnap := fmt.Sprintf("[CPU:%d%%, Buf:%d%%, Peers:%d, Speed:%.1fMB/s] (AVG 60s)", 
+		int(avgCPU), buffer, activeStats.ActivePeers, avgTorrentSpeed)
 	
 	metricsHistory = append(metricsHistory, currentSnap)
 	if len(metricsHistory) > 3 { metricsHistory = metricsHistory[1:] }
 	historyStr := strings.Join(metricsHistory, " -> ")
 
+	isStaleBuffer := avgTorrentSpeed < 0.1
 	bufferStatus := "FRESH"
 	if isStaleBuffer { bufferStatus = "STALE (Ignore it)" }
 
-	contextStr := fmt.Sprintf("Fiber Optic, 4K Stream, File:%.1fGB, ActiveTorrents:%d, TotalDLSpeed:%.1fMB/s, Buffer:%s", 
-		fileSizeGB, realActiveCount, lastKnownTotalSpeed, bufferStatus)
+	fSize := activeT.Size
+	if fSize == 0 { fSize = activeT.Torrent.Length() }
+	fileSizeGB := float64(fSize) / (1024 * 1024 * 1024)
 
-	prompt := fmt.Sprintf("<|im_start|>system\nYou are a BitTorrent Tuning unit for Raspberry Pi 4.\nContext: %s\nIMPORTANT: If Speed is < 1.2MB/s and CPU is Low, set connections_limit=60, peer_timeout=15.\nObjective: 100%% Buffer, Fast Performance, Stable CPU.\nRespond ONLY compact JSON: {\"connections_limit\": 25, \"peer_timeout\": 30}<|im_end|>\n<|im_start|>user\nAnalyze trend and context. DECIDE.<|im_end|>\n<|im_start|>assistant\n", 
+	cpuPressure := "NORMAL"
+	if avgCPU > 75 { cpuPressure = "CRITICAL (Lags detected, REDUCE connections NOW)" }
+
+	contextStr := fmt.Sprintf("Fiber Internet, 4K Movie Streaming, File:%.1fGB, ActiveTorr:%d, TotalDLSpeed:%.1fMB/s (AVG), Buffer:%s, CPU_Pressure:%s", 
+		fileSizeGB, realActiveCount, avgTotalSpeed, bufferStatus, cpuPressure)
+
+	prompt := fmt.Sprintf("<|im_start|>system\nYou are a BitTorrent Tuning unit for Raspberry Pi 4.\nContext: %s\nTrends: %s\nIMPORTANT: If CPU_Pressure is CRITICAL, set connections_limit=15 immediately.\nObjective: 100%% Buffer, Fast Performance, Stable CPU.\nRespond ONLY compact JSON: {\"connections_limit\": 25, \"peer_timeout\": 30}<|im_end|>\n<|im_start|>user\nAnalyze trends and context. DECIDE.<|im_end|>\n<|im_start|>assistant\n{\"connections_limit\":", 
 		contextStr, historyStr)
 
 	tweak, err := fetchAIJSON[AITweak](aiURL, prompt)
 	if err != nil {
-		log.Printf("[AI-Pilot] AI Communication Delay: %v", err)
+		log.Printf("[AI-Pilot] Communication Delay: %v", err)
 		return
 	}
 
@@ -119,12 +178,21 @@ func runTuningCycle(aiURL string) {
 	if activeT.Torrent != nil {
 		oldConns := activeT.Torrent.MaxEstablishedConns()
 		oldTimeout := lastTimeout
-		
+
+		// Hysteresis: Skip if no change
+		if tweak.ConnectionsLimit == lastConns && tweak.PeerTimeout == lastTimeout {
+			pulseCounter++
+			if pulseCounter >= 5 { // Every ~5 minutes (5 * 60s)
+				log.Printf("[AI-Pilot] Pulse: Optimizer active, values stable at Conns(%d) Timeout(%ds). Metrics: %s", 
+					lastConns, lastTimeout, currentSnap)
+				pulseCounter = 0
+			}
+			return
+		}
+		pulseCounter = 0 // Reset on actual change
+
 		activeT.Torrent.SetMaxEstablishedConns(tweak.ConnectionsLimit)
-		
-		// V1.6.1: Sync with exported variable for main package
 		atomic.StoreInt32(&CurrentLimit, int32(tweak.ConnectionsLimit))
-		
 		activeT.AddExpiredTime(time.Duration(tweak.PeerTimeout) * time.Second)
 		lastConns = tweak.ConnectionsLimit
 		lastTimeout = tweak.PeerTimeout
@@ -136,7 +204,7 @@ func runTuningCycle(aiURL string) {
 
 func fetchAIJSON[T any](url string, prompt string) (*T, error) {
 	reqBody, _ := json.Marshal(map[string]interface{}{
-		"prompt": prompt, "n_predict": 64, "temperature": 0.0,
+		"prompt": prompt, "n_predict": 32, "temperature": 0.0,
 		"stop": []string{"<|im_end|>", "}"},
 	})
 	client := &http.Client{Timeout: 45 * time.Second}
@@ -144,25 +212,36 @@ func fetchAIJSON[T any](url string, prompt string) (*T, error) {
 	if err != nil { return nil, err }
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK { return nil, fmt.Errorf("Status %d", resp.StatusCode) }
+
 	var aiResp struct { Content string `json:"content"` }
-	json.NewDecoder(resp.Body).Decode(&aiResp)
-	
-	content := strings.TrimSpace(aiResp.Content)
-	if !strings.HasPrefix(content, "{") { content = "{" + content }
+	if err := json.NewDecoder(resp.Body).Decode(&aiResp); err != nil {
+		return nil, fmt.Errorf("AI decode error: %v", err)
+	}
+
+	trimmed := strings.TrimSpace(aiResp.Content)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty AI response")
+	}
+
+	content := "{\"connections_limit\":" + trimmed
 	if !strings.HasSuffix(content, "}") { content = content + "}" }
+
+	// V1.6.19: Surgical replacement of units to avoid corrupting JSON keys (like connections_limit)
 	content = strings.ReplaceAll(content, "%", "")
-	content = strings.ReplaceAll(content, "s", "")
+	content = strings.ReplaceAll(content, "s,", ",")
+	content = strings.ReplaceAll(content, "s}", "}")
 
 	var result T
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return nil, fmt.Errorf("JSON parse error | Raw: %s", content)
+		return nil, fmt.Errorf("JSON parse error | Raw: %s | Err: %v", content, err)
 	}
 	return &result, nil
 }
 
+
 func getCPUUsage() int {
 	t1Total, t1Idle := readCPUSample()
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	t2Total, t2Idle := readCPUSample()
 	totalDiff := t2Total - t1Total
 	idleDiff := t2Idle - t1Idle

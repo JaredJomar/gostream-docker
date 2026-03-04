@@ -76,14 +76,14 @@ func SetBTSets(sets *BTSets) {
 	if ReadOnly {
 		return
 	}
-	// failsafe checks (use defaults)
-	if sets.CacheSize == 0 {
+	// V301: Failsafe checks - only set defaults if the value is truly missing/invalid (<= 0)
+	if sets.CacheSize <= 0 {
 		sets.CacheSize = 128 * 1024 * 1024
 	}
-	if sets.ConnectionsLimit == 0 {
+	if sets.ConnectionsLimit <= 0 {
 		sets.ConnectionsLimit = 25
 	}
-	if sets.TorrentDisconnectTimeout == 0 {
+	if sets.TorrentDisconnectTimeout <= 0 {
 		sets.TorrentDisconnectTimeout = 30
 	}
 
@@ -150,7 +150,7 @@ func SetDefaultConfig() {
 	sets := new(BTSets)
 	sets.CacheSize = 128 * 1024 * 1024 // 128 MB
 	sets.PreloadCache = 0
-	sets.ConnectionsLimit = 25 // CRITICAL: Do not increase for Pi 4
+	sets.ConnectionsLimit = 25
 	sets.RetrackersMode = 1
 	sets.TorrentDisconnectTimeout = 30
 	sets.ReaderReadAHead = 75 // 75%
@@ -193,12 +193,12 @@ func loadBTSets() {
 			if BTsets.ReaderReadAHead < 5 {
 				BTsets.ReaderReadAHead = 5
 			}
+			// V301: Do NOT override TorrentDisconnectTimeout here if already loaded from DB
 			return
 		}
 		log.TLogln("Error unmarshal btsets", err)
 	}
-	// initialize defaults on error
-	// Inline SetDefaultConfig logic to avoid double locking or use an unexported function
+	// initialize defaults only on error
 	sets := new(BTSets)
 	sets.CacheSize = 128 * 1024 * 1024 // 128 MB
 	sets.PreloadCache = 0
