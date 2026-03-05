@@ -9,7 +9,6 @@
     <img src="https://img.shields.io/badge/PGO-Enabled-8B5CF6?style=flat-square" alt="PGO Enabled"/>
     <img src="https://img.shields.io/badge/FUSE-3-FF6B35?style=flat-square" alt="FUSE 3"/>
     <img src="https://img.shields.io/badge/Plex-Integrated-E5A00D?style=flat-square&logo=plex&logoColor=white" alt="Plex"/>
-    <img src="https://img.shields.io/badge/License-MIT-22c55e?style=flat-square" alt="MIT License"/>
   </p>
 </p>
 
