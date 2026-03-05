@@ -143,7 +143,7 @@ BitTorrent Peers ←→ GoStorm Engine (:8090)
               Zero-Network, Zero-Copy Hot Path
                          │
          ┌───────────────────────────────────┐
-         │        FUSE Proxy Layer           │
+         │       GoStream FUSE Layer         │
          │  L1: Read-Ahead Cache (256 MB)    │
          │  L2: SSD Warmup Head (64 MB/file) │
          │  L3: SSD Warmup Tail (16 MB/file) │
@@ -162,7 +162,7 @@ BitTorrent Peers ←→ GoStorm Engine (:8090)
 
 | Port | Purpose |
 |------|---------|
-| `:8080` | FUSE Proxy HTTP endpoint |
+| `:8080` | GoStream HTTP endpoint |
 | `:8090` | GoStorm API — JSON torrent management |
 | `:8096` | Metrics, Control Panel, Plex Webhook |
 | `:8095` | Health Monitor Dashboard (Python, separate process) |
@@ -175,7 +175,7 @@ BitTorrent Peers ←→ GoStorm Engine (:8090)
 
 ### 1. Zero-Network Native Bridge
 
-GoStream runs as a **single process** — GoStorm engine and FUSE proxy compiled into one binary. When Plex reads a `.mkv` byte range, the FUSE layer calls directly into GoStorm via an in-memory `io.Pipe()`: no TCP round-trip, no HTTP header parsing, no serialization, no proxy overhead. Metadata operations are direct Go function calls. This eliminates the network RTT that causes stuttering in every HTTP-based torrent streaming proxy on constrained hardware.
+GoStream runs as a **single process** — GoStorm engine and GoStream FUSE compiled into one binary. When Plex reads a `.mkv` byte range, the FUSE layer calls directly into GoStorm via an in-memory `io.Pipe()`: no TCP round-trip, no HTTP header parsing, no serialization, no proxy overhead. Metadata operations are direct Go function calls. This eliminates the network RTT that causes stuttering in every HTTP-based torrent streaming proxy on constrained hardware.
 
 ### 2. Two-Layer SSD Warmup Cache *(optional)*
 
@@ -581,7 +581,7 @@ Settings are written to `config.json` and require a **service restart**. The **R
 | **Paths** | Physical Source Path (Samba root), FUSE Mount Path |
 | **FUSE Timing & Buffers** | Read Buffer (KB), FUSE Block Size, Attr/Entry Timeout (s) |
 | **Cache Management** | Metadata Cache (MB), Max Cache Entries, Cleanup Interval (min) |
-| **Connectivity & Rescue** | GoStorm URL, Rescue Grace/Cooldown, Metrics Port, Log Level, Proxy Port, BlockList URL |
+| **Connectivity & Rescue** | GoStorm URL, Rescue Grace/Cooldown, Metrics Port, Log Level, GoStream Port, BlockList URL |
 
 ### GoStorm Engine Panel (right)
 
@@ -631,7 +631,6 @@ Appears automatically during playback:
 - 🎬 **Movie poster** (fetched from TMDB)
 - 🏷️ **Quality badges**: `PRIORITY`, `4K`, `DV`, `ATMOS`, `HDR10+`
 - 📡 **LIVE indicator** + 5-minute average speed
-- 💾 **Source indicator**: `Proxy RAM` or `Warmup SSD`
 - 👥 **Peer/seeder count** for the active torrent
 
 ### Sync Controls
@@ -662,7 +661,7 @@ nano /home/pi/GoStream/config.json
 | `warmup_head_size_mb` | `64` | Per-file SSD warmup size |
 | `master_concurrency_limit` | `25` | Max concurrent data slots |
 | `gostorm_url` | `http://127.0.0.1:8090` | GoStorm internal API URL |
-| `proxy_listen_port` | `8080` | FUSE proxy HTTP port |
+| `proxy_listen_port` | `8080` | GoStream FUSE HTTP port |
 | `metrics_port` | `8096` | Metrics, Control Panel, Webhook port |
 | `blocklist_url` | *(BT_BlockLists)* | Gzipped IP blocklist URL (24 h refresh) |
 | `plex.url` | — | Plex server URL |
