@@ -14,7 +14,7 @@ import (
 	torrstor "gostream/internal/gostorm/torr/storage/torrstor"
 	tsutils "gostream/internal/gostorm/utils"
 	"gostream/internal/gostorm/web"
-	"hash/fnv"
+	"github.com/cespare/xxhash/v2"
 	"io"
 	"log"
 	"net"
@@ -249,9 +249,7 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 //   - IsDir() is still cached from ReadDir (no syscall)
 //   - POSIX bits ensure proper FUSE/Samba/Linux kernel compatibility
 func hashFilenameToInode(name string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(name))
-	return h.Sum64()
+	return xxhash.Sum64String(name)
 }
 
 type Metadata struct {
@@ -2153,9 +2151,7 @@ func newReadAheadCache() *ReadAheadCache {
 }
 
 func (c *ReadAheadCache) getShard(path string) *raShard {
-	h := fnv.New64a()
-	h.Write([]byte(path))
-	return c.shards[h.Sum64()&c.shardMask]
+	return c.shards[xxhash.Sum64String(path)&c.shardMask]
 }
 
 // V294: recycle returns a buffer to the pool if it matches standard chunk size.

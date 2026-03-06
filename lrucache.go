@@ -2,9 +2,10 @@ package main
 
 import (
 	"container/list"
-	"hash/fnv"
 	"sync"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // ShardedLRUCache Wrapper per ridurre la contesa sui lock (V231-Fix)
@@ -34,9 +35,7 @@ func NewLRUCache(capacity int64, ttl time.Duration) *LRUCache {
 }
 
 func (c *LRUCache) getShard(key string) *simpleLRUCache {
-	h := fnv.New64a()
-	h.Write([]byte(key))
-	return c.shards[h.Sum64()&c.shardMask]
+	return c.shards[xxhash.Sum64String(key)&c.shardMask]
 }
 
 func (c *LRUCache) Get(key string) (*Metadata, bool) {

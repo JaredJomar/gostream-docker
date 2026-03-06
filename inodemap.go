@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // V133: Deterministic Inode Mapping for Plex/SMB Stability
@@ -110,9 +111,7 @@ func NewInodeMap(savePath string, logger Logger) *InodeMap {
 }
 
 func (im *InodeMap) getShard(key string) *inodeShard {
-	h := fnv.New64a()
-	h.Write([]byte(key))
-	return im.shards[h.Sum64()&im.shardMask]
+	return im.shards[xxhash.Sum64String(key)&im.shardMask]
 }
 
 func (im *InodeMap) setDirty(isDirty bool) {
@@ -498,18 +497,14 @@ func (im *InodeMap) PruneMissing(foundFiles map[string]bool) int {
 
 func generateFileInode(infohash string, index int) uint64 {
 	key := fmt.Sprintf("%s:%d", strings.ToLower(infohash), index)
-	h := fnv.New64a()
-	h.Write([]byte(key))
-	return h.Sum64() & InodeFileMask
+	return xxhash.Sum64String(key) & InodeFileMask
 }
 
 func generateDirInode(relativePath string) uint64 {
 	if relativePath == "/" || relativePath == "" {
 		return InodeRoot
 	}
-	h := fnv.New64a()
-	h.Write([]byte(relativePath))
-	return h.Sum64() | InodeDirMask
+	return xxhash.Sum64String(relativePath) | InodeDirMask
 }
 
 var (

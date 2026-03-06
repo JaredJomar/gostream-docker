@@ -1,6 +1,6 @@
 module gostream
 
-go 1.24.0
+go 1.24.6
 
 require github.com/hanwen/go-fuse/v2 v2.9.0
 
@@ -14,6 +14,7 @@ require (
 	github.com/anacrolix/missinggo/v2 v2.10.0
 	github.com/anacrolix/publicip v0.3.1
 	github.com/anacrolix/torrent v1.55.0
+	github.com/cespare/xxhash/v2 v2.2.0
 	github.com/gin-contrib/cors v1.7.6
 	github.com/gin-contrib/location/v2 v2.0.0
 	github.com/gin-gonic/gin v1.11.0
