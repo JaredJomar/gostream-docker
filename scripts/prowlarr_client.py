@@ -19,13 +19,15 @@ class ProwlarrClient:
         """
         Directly query Prowlarr API for a specific IMDB ID.
         """
-        # Map Stremio 'series' to Prowlarr 'tv'
-        prowlarr_type = "tv" if content_type == "series" else content_type
+        # Map Stremio types to Prowlarr search types
+        # Movies -> movie, Series -> tvsearch
+        prowlarr_type = "tvsearch" if content_type == "series" else "movie"
         
         params = {
             "apikey": self.API_KEY,
-            "imdbId": imdb_id,
-            "type": prowlarr_type
+            "query": imdb_id,  # Prowlarr V1 uses query for ID searches
+            "type": prowlarr_type,
+            "indexerIds": "-2"  # All indexers
         }
         try:
             response = requests.get(self.SEARCH_ENDPOINT, params=params, timeout=45)
