@@ -93,6 +93,14 @@ If a better version of a film becomes available later (for example a 4K HDR rele
 TV series work the same way: a weekly script finds new seasons and episodes, organises them in the Plex-compatible folder structure (`Show Name/Season 01/`), and they appear in your library within the week.
 
 You can also add a title to your **Plex Watchlist** from any device and it will appear in your library within the hour.
+### Prowlarr Integration (Resilience)
+
+To ensure the system remains functional even when public aggregators like Torrentio are down, GoStream includes a **Prowlarr Adapter**. This allows you to use your own self-hosted Prowlarr instance as the primary source for torrents.
+
+The sync scripts implement a **Strict Fallback** logic: they first query your Prowlarr indexers using IMDB IDs for maximum precision. If no results are found locally, they automatically fall back to Torrentio.
+
+See the [Prowlarr Adapter Documentation](docs/prowlarr-adapter.md) for setup and technical details.
+
 
 ### 100% local, no subscriptions
 

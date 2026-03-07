@@ -11,8 +11,8 @@ from typing import List, Dict, Any, Optional
 
 class ProwlarrClient:
     def __init__(self):
-        self.API_KEY = "80b0e137663b4523bae737ec8f5fc791"
-        self.BASE_URL = "http://192.168.1.250:9696"
+        self.API_KEY = "API_KEY"
+        self.BASE_URL = "http://<your-ip>:9696"
         self.SEARCH_ENDPOINT = f"{self.BASE_URL}/api/v1/search"
         
     def fetch_from_prowlarr(self, imdb_id: str, content_type: str = "movie") -> List[Dict[str, Any]]:
