@@ -11,9 +11,14 @@ from typing import List, Dict, Any, Optional
 
 class ProwlarrClient:
     def __init__(self):
-        self.API_KEY = "API_KEY"
+        self.API_KEY = "API-KEY"
         self.BASE_URL = "http://<your-ip>:9696"
         self.SEARCH_ENDPOINT = f"{self.BASE_URL}/api/v1/search"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json'
+        })
         
     def fetch_from_prowlarr(self, imdb_id: str, content_type: str = "movie") -> List[Dict[str, Any]]:
         """
@@ -30,7 +35,8 @@ class ProwlarrClient:
             "indexerIds": "-2"  # All indexers
         }
         try:
-            response = requests.get(self.SEARCH_ENDPOINT, params=params, timeout=10)
+            # Use session for connection reuse and 30s timeout
+            response = self.session.get(self.SEARCH_ENDPOINT, params=params, timeout=30)
             if response.status_code == 200:
                 return response.json()
             else:
