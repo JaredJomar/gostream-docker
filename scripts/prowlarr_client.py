@@ -6,13 +6,24 @@ Converts Prowlarr/Newznab results to Stremio/Torrentio format.
 
 import json
 import logging
+import os
 import requests
 from typing import List, Dict, Any, Optional
 
 class ProwlarrClient:
     def __init__(self):
-        self.API_KEY = "API-KEY"
-        self.BASE_URL = "http://<your-ip>:9696"
+        # ── CONFIGURATION ──────────────────────────────────────────────────────
+        # Set to True to use Prowlarr, False to use Torrentio only (Default)
+        self.ENABLED = False 
+        
+        # Override via environment variable if present
+        if os.getenv("PROWLARR_ENABLED", "false").lower() == "true":
+            self.ENABLED = True
+            
+        self.API_KEY = os.getenv("PROWLARR_API_KEY", "YOUR_PROWLARR_API_KEY")
+        self.BASE_URL = os.getenv("PROWLARR_URL", "http://localhost:9696")
+        # ───────────────────────────────────────────────────────────────────────
+
         self.SEARCH_ENDPOINT = f"{self.BASE_URL}/api/v1/search"
         self.session = requests.Session()
         self.session.headers.update({
@@ -24,6 +35,9 @@ class ProwlarrClient:
         """
         Directly query Prowlarr API for a specific IMDB ID.
         """
+        if not self.ENABLED:
+            return []
+            
         # Map Stremio types to Prowlarr search types
         # Movies -> movie, Series -> tvsearch
         prowlarr_type = "tvsearch" if content_type == "series" else "movie"
@@ -49,6 +63,9 @@ class ProwlarrClient:
         """
         Fetch torrents from Prowlarr and return them in Stremio/Torrentio format.
         """
+        if not self.ENABLED:
+            return []
+            
         prowlarr_results = self.fetch_from_prowlarr(imdb_id, content_type)
         return self._map_to_stremio_format(prowlarr_results)
 
