@@ -4,15 +4,18 @@ After=network.target gostream.service
 
 [Service]
 Type=simple
-# Change User to the account that owns the install directory
-User=pi
+# Change User to your system account
+User=YOUR_USER
 # Change to your GoStream install directory
 WorkingDirectory=/home/pi/GoStream
-ExecStart=/usr/bin/python3 /home/pi/GoStream/scripts/health-monitor.py
+ExecStart=/usr/bin/python3 scripts/health-monitor.py
 Restart=always
 RestartSec=5
 TimeoutStopSec=5
 Environment="PYTHONUNBUFFERED=1"
+
+StandardOutput=append:logs/health-monitor.log
+StandardError=append:logs/health-monitor.log
 
 [Install]
 WantedBy=multi-user.target

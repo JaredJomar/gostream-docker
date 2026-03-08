@@ -246,13 +246,21 @@ check_prerequisites() {
 collect_paths() {
     print_header "[1/5] System Paths"
 
-    ask "GoStream install directory" "/home/pi/GoStream" INSTALL_DIR
+    # V1.4.6: Auto-detect current directory, user and group for a seamless 'press-enter' experience
+    local default_install_dir="${SCRIPT_DIR}"
+    local default_user
+    default_user=$(whoami)
+    local default_group
+    default_group=$(id -gn "$default_user" 2>/dev/null || echo "$default_user")
+
+    ask "GoStream install directory" "$default_install_dir" INSTALL_DIR
     ask "Physical MKV source path   (physical_source_path)" "/mnt/gostream-mkv-real" STORAGE_PATH
     ask "FUSE virtual mount path     (fuse_mount_path)"     "/mnt/gostream-mkv-virtual" FUSE_MOUNT
-    ask "System user that owns GoStream" "pi" SYSTEM_USER
+    ask "System user that owns GoStream" "$default_user" SYSTEM_USER
+    ask "System group" "$default_group" SYSTEM_GROUP
 
-    # Derive BASE_DIR as the parent of INSTALL_DIR (holds logs/ and STATE/)
-    BASE_DIR="$(dirname "${INSTALL_DIR}")"
+    # Derive BASE_DIR as INSTALL_DIR (V1.4.6: logs/ and STATE/ are now inside)
+    BASE_DIR="${INSTALL_DIR}"
 
     echo ""
     print_info "Derived base directory : ${BASE_DIR}"
@@ -676,7 +684,7 @@ Environment=GOGC=100
 
 Type=simple
 User=${SYSTEM_USER}
-Group=${SYSTEM_USER}
+Group=${SYSTEM_GROUP}
 
 WorkingDirectory=${INSTALL_DIR}
 
@@ -687,10 +695,8 @@ ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5; do getent hosts google.com >/dev/nu
 ExecStartPre=-/usr/bin/${FUSERMOUNT_CMD} -uz ${FUSE_MOUNT}
 ExecStartPre=/bin/mkdir -p ${FUSE_MOUNT}
 
-# Main binary — no CLI args needed:
-#   --path defaults to WorkingDirectory (${INSTALL_DIR})
-#   physical_source_path and fuse_mount_path are read from config.json
-ExecStart=${INSTALL_DIR}/gostream
+# V1.4.6: Main binary — using --path . for true portability (STATE stays in WorkingDirectory)
+ExecStart=./gostream --path .
 
 # Allow gostream to stabilize, then restart Samba so it sees the FUSE mount
 ExecStartPost=/bin/sleep 2
@@ -701,8 +707,9 @@ RestartSec=10
 LimitNOFILE=65536
 LimitNPROC=4096
 
-StandardOutput=append:${BASE_DIR}/logs/gostream.log
-StandardError=append:${BASE_DIR}/logs/gostream.log
+# Centralized logging inside the GoStream directory (relative to WorkingDirectory)
+StandardOutput=append:logs/gostream.log
+StandardError=append:logs/gostream.log
 
 # Cleanly unmount FUSE on stop
 ExecStop=/usr/bin/${FUSERMOUNT_CMD} -uz ${FUSE_MOUNT}
@@ -723,11 +730,15 @@ After=network.target gostream.service
 Type=simple
 User=${SYSTEM_USER}
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/bin/python3 ${INSTALL_DIR}/scripts/health-monitor.py
+ExecStart=/usr/bin/python3 scripts/health-monitor.py
 Restart=always
 RestartSec=5
 TimeoutStopSec=5
 Environment=PYTHONUNBUFFERED=1
+
+# Centralized logging for dashboard
+StandardOutput=append:logs/health-monitor.log
+StandardError=append:logs/health-monitor.log
 
 [Install]
 WantedBy=multi-user.target

@@ -10,11 +10,12 @@ Environment=GOMEMLIMIT=2200MiB
 Environment=GOGC=100
 
 Type=simple
-# Change User/Group to the account that owns the install directory
-User=pi
-Group=pi
+# Change User/Group to your system account (e.g., pi or user)
+User=YOUR_USER
+Group=YOUR_GROUP
 
-# Change to your GoStream install directory
+# Change to your GoStream install directory. 
+# All other paths (logs, state, scripts) will be relative to this.
 WorkingDirectory=/home/pi/GoStream
 
 # Wait for DNS before starting (required for tracker resolution)
@@ -24,14 +25,12 @@ ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5; do nslookup www.google.com >/dev/nu
 ExecStartPre=-/usr/bin/fusermount -uz /mnt/torrserver-go
 ExecStartPre=/bin/mkdir -p /mnt/torrserver-go
 
-# Main binary — no CLI args needed: --path defaults to WorkingDirectory,
-# physical_source_path and fuse_mount_path are read from config.json
-ExecStart=/home/pi/GoStream/gostream
+# V1.4.6: Main binary — using --path . for true portability (STATE stays in WorkingDirectory)
+ExecStart=./gostream --path .
 
-# Restart Samba and NFS after gostream starts (required for FUSE-backed shares)
+# Restart Samba after gostream starts (required for FUSE-backed shares)
 ExecStartPost=/bin/sleep 2
 ExecStartPost=/usr/bin/sudo /bin/systemctl restart smbd
-ExecStartPost=/usr/bin/sudo /bin/systemctl restart nfs-kernel-server
 
 # FUSE unmount on stop
 ExecStop=/usr/bin/fusermount -uz /mnt/torrserver-go
@@ -41,9 +40,9 @@ RestartSec=10
 LimitNOFILE=65536
 LimitNPROC=4096
 
-# Change log path to match your logs directory (parent of GoStream dir + /logs)
-StandardOutput=append:/home/pi/logs/gostream.log
-StandardError=append:/home/pi/logs/gostream.log
+# V1.4.6: Centralized logging inside the GoStream directory (relative to WorkingDirectory)
+StandardOutput=append:logs/gostream.log
+StandardError=append:logs/gostream.log
 
 [Install]
 WantedBy=multi-user.target
