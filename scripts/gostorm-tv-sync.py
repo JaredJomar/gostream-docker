@@ -1437,7 +1437,7 @@ class GoStormTV:
         active_hashes = {(t.get('hash') or '').lower() for t in torrents if t.get('hash')}
 
         rehydrated = 0
-        MAX_REHYDRATE_PER_RUN = 20  # Limit to prevent GoStorm saturation
+        MAX_REHYDRATE_PER_RUN = 100  # Limit to prevent GoStorm saturation
 
         if not os.path.exists(self.TV_DIR):
             return
