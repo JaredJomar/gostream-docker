@@ -356,6 +356,13 @@ func (c *NativeClient) FetchBlock(hash string, fileID int, offset int64, p []byt
 		t.Stream(fileID, req, resp)
 	}()
 
+	// V283-Fix: Ensure io.ReadFull is unblocked if context expires (8s timeout).
+	// Previously, if t.Stream() stalled without closing the pipe, FetchBlock would hang forever.
+	go func() {
+		<-ctx.Done()
+		pr.Close() // Force unblock io.ReadFull on timeout/cancel
+	}()
+
 	n, err := io.ReadFull(pr, p)
 	pr.Close()
 

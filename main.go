@@ -3310,10 +3310,12 @@ func main() {
 // Detects smbd child processes stuck in D-state (uninterruptible sleep on FUSE I/O).
 // When smbd enters D-state, the Synology CIFS mount becomes unresponsive and can't
 // be remounted until gostream restarts (only way to unblock kernel FUSE operations).
-// After 4 consecutive detections (180s), sends SIGTERM to self for graceful restart.
+// Strategy: Level 1 (3 hits, 180s) - Emergency Unblock (Interrupt all pumps).
+//           Level 2 (10 hits, 600s) - Graceful Restart (Last resort).
 func smbdWatchdog() {
 	const checkInterval = 60 * time.Second
-	const threshold = 5 // consecutive D-state detections before restart (300s total)
+	const unblockThreshold = 3 // 180s - Emergency unblock (interrupt all pumps)
+	const restartThreshold = 10 // 600s - Full restart (persistent stall)
 	consecutiveHits := 0
 
 	ticker := time.NewTicker(checkInterval)
@@ -3322,18 +3324,39 @@ func smbdWatchdog() {
 	for range ticker.C {
 		if countDStateSmbd() > 0 {
 			consecutiveHits++
-			logger.Printf("[Watchdog] D-state smbd detected (%d/%d)", consecutiveHits, threshold)
-			if consecutiveHits >= threshold {
-				logger.Printf("[Watchdog] D-state smbd persistent for %ds — triggering graceful restart",
+			logger.Printf("[Watchdog] D-state smbd detected (%d/%d)", consecutiveHits, restartThreshold)
+
+			// FASE 1: Sblocco di emergenza (3 minuti)
+			if consecutiveHits == unblockThreshold {
+				logger.Printf("[Watchdog] D-state persistent for %ds — triggering EMERGENCY UNBLOCK",
 					consecutiveHits*int(checkInterval/time.Second))
-				// SIGTERM triggers the existing signal handler for graceful shutdown.
-				// systemd Restart=always will restart us.
+
+				// Interrompiamo tutti i reader attivi per sbloccare le Read() appese.
+				// Questo causa errori I/O temporanei per Samba/Plex ma dovrebbe sbloccare il kernel.
+				activePumps.Range(func(key, value interface{}) bool {
+					if ps, ok := value.(*NativePumpState); ok {
+						if ps.reader != nil {
+							logger.Printf("[Watchdog] Interrupting pump: %s", filepath.Base(ps.path))
+							ps.reader.Interrupt()
+						}
+						if ps.cancel != nil {
+							ps.cancel() // Stop the background pumping loop
+						}
+					}
+					return true
+				})
+			}
+
+			// FASE 2: Riavvio completo (10 minuti)
+			if consecutiveHits >= restartThreshold {
+				logger.Printf("[Watchdog] D-state STILL persistent for %ds — triggering graceful restart",
+					consecutiveHits*int(checkInterval/time.Second))
 				syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 				return
 			}
 		} else {
 			if consecutiveHits > 0 {
-				logger.Printf("[Watchdog] D-state cleared after %d hit(s)", consecutiveHits)
+				logger.Printf("[Watchdog] D-state cleared after %d hit(s) (Max: %d)", consecutiveHits, restartThreshold)
 			}
 			consecutiveHits = 0
 		}
