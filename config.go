@@ -96,11 +96,19 @@ type Config struct {
 
 	// --- External Services (V1.4.6) ---
 	Plex struct {
-		URL       string `json:"url"`
-		Token     string `json:"token"`
-		LibraryID int    `json:"library_id"`
+		URL         string `json:"url"`
+		Token       string `json:"token"`
+		LibraryID   int    `json:"library_id"`
+		TVLibraryID int    `json:"tv_library_id"`
 	} `json:"plex"`
 	TMDBAPIKey string `json:"tmdb_api_key"`
+
+	// --- Prowlarr Indexer ---
+	Prowlarr struct {
+		Enabled bool   `json:"enabled"`
+		APIKey  string `json:"api_key"`
+		URL     string `json:"url"`
+	} `json:"prowlarr"`
 }
 
 // LoadConfig loads configuration from environment variables with defaults

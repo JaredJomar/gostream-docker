@@ -495,7 +495,12 @@ generate_config_json() {
     "library_id": 0,
     "tv_library_id": 0
   },
-  "tmdb_api_key": ""
+  "tmdb_api_key": "",
+  "prowlarr": {
+    "enabled": false,
+    "api_key": "",
+    "url": ""
+  }
 }
 TEMPLATE_EOF
     fi

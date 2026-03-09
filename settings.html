@@ -165,6 +165,7 @@
         .form-section.advanced {
             display: none;
         }
+        .hidden-permanently { display: none !important; }
 
         .form-section.advanced.show {
             display: block;
@@ -543,7 +544,7 @@
                         </div>
                     </div>
 
-                    <div class="form-section advanced">
+                    <div class="form-section advanced hidden-permanently">
                         <div class="form-section-title">FUSE Timing & Buffers</div>
                         <div class="form-grid">
                             <div class="form-group">
@@ -569,7 +570,7 @@
                         </div>
                     </div>
 
-                    <div class="form-section advanced">
+                    <div class="form-section advanced hidden-permanently">
                         <div class="form-section-title">Cache Management</div>
                         <div class="form-grid">
                             <div class="form-group">
@@ -667,7 +668,29 @@
                     </div>
 
                     <div class="form-section">
-                        <div class="form-section-title">External Services</div>
+                        <div class="form-section-title">Prowlarr Indexer</div>
+                        <div class="switch-item">
+                            <span>Enable Prowlarr</span>
+                            <label class="switch"><input type="checkbox" name="prowlarr_enabled"
+                                    data-nested="prowlarr.enabled"><span class="slider"></span></label>
+                        </div>
+                        <div class="hint" style="margin-bottom: 12px;">Use Prowlarr as indexer; if disabled, uses Torrentio</div>
+                        <div class="form-grid">
+                            <div class="form-group" style="grid-column: 1 / -1;">
+                                <label>API Key</label>
+                                <input type="text" name="prowlarr_api_key" data-nested="prowlarr.api_key">
+                                <div class="hint">Prowlarr API key (Settings → General → API Key)</div>
+                            </div>
+                            <div class="form-group" style="grid-column: 1 / -1;">
+                                <label>URL</label>
+                                <input type="text" name="prowlarr_url" data-nested="prowlarr.url">
+                                <div class="hint">Prowlarr base URL (e.g. http://192.168.1.250:9696)</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <div class="form-section-title">Media Manager (Plex)</div>
                         <div class="form-grid">
                             <div class="form-group" style="grid-column: 1 / -1;">
                                 <label>TMDB API key</label>
@@ -677,13 +700,19 @@
                                 <label>Plex URL</label>
                                 <input type="text" name="plex_url" data-nested="plex.url">
                             </div>
-                            <div class="form-group">
+                            <div class="form-group" style="grid-column: 1 / -1;">
                                 <label>Plex Token</label>
                                 <input type="text" name="plex_token" data-nested="plex.token">
                             </div>
                             <div class="form-group">
-                                <label>Plex Library ID</label>
+                                <label>Movies Library ID</label>
                                 <input type="number" name="plex_library_id" data-nested="plex.library_id">
+                                <div class="hint">Plex library ID for movies (0 = disabled)</div>
+                            </div>
+                            <div class="form-group">
+                                <label>Series TV Library ID</label>
+                                <input type="number" name="plex_tv_library_id" data-nested="plex.tv_library_id">
+                                <div class="hint">Plex library ID for TV series (0 = disabled)</div>
                             </div>
                         </div>
                     </div>
@@ -1066,6 +1095,14 @@
                     form.querySelector('[data-nested="plex.url"]').value = p.url || p.URL || "";
                     form.querySelector('[data-nested="plex.token"]').value = p.token || p.Token || "";
                     form.querySelector('[data-nested="plex.library_id"]').value = p.library_id || p.LibraryID || 0;
+                    form.querySelector('[data-nested="plex.tv_library_id"]').value = p.tv_library_id || p.TVLibraryID || 0;
+                }
+                const pr = originalEngine.prowlarr || originalEngine.Prowlarr;
+                if (pr) {
+                    const prEnabled = form.querySelector('[data-nested="prowlarr.enabled"]');
+                    if (prEnabled) prEnabled.checked = pr.enabled || false;
+                    form.querySelector('[data-nested="prowlarr.api_key"]').value = pr.api_key || pr.APIKey || "";
+                    form.querySelector('[data-nested="prowlarr.url"]').value = pr.url || pr.URL || "";
                 }
                 markCouplingLoaded();
             } catch (e) { console.error("Engine load error", e); }
@@ -1119,7 +1156,16 @@
             data[plexKey] = {
                 url: formData.get('plex_url') || oldPlex.url || oldPlex.URL || "",
                 token: formData.get('plex_token') || oldPlex.token || oldPlex.Token || "",
-                library_id: parseInt(formData.get('plex_library_id')) || oldPlex.library_id || oldPlex.LibraryID || 0
+                library_id: parseInt(formData.get('plex_library_id')) || oldPlex.library_id || oldPlex.LibraryID || 0,
+                tv_library_id: parseInt(formData.get('plex_tv_library_id')) || oldPlex.tv_library_id || oldPlex.TVLibraryID || 0
+            };
+
+            const prowlarrKey = originalEngine.prowlarr ? 'prowlarr' : 'Prowlarr';
+            const oldProwlarr = originalEngine[prowlarrKey] || {};
+            data[prowlarrKey] = {
+                enabled: formData.has('prowlarr_enabled'),
+                api_key: formData.get('prowlarr_api_key') || oldProwlarr.api_key || "",
+                url: formData.get('prowlarr_url') || oldProwlarr.url || ""
             };
 
             const res = await fetch('/api/config', {
