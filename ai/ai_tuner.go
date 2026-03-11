@@ -289,11 +289,10 @@ func runTuningCycle(aiURL string) {
 		historyPrefix = "history=" + historyStr + " "
 	}
 	prompt := fmt.Sprintf(
-		"<|im_start|>system\nTune BitTorrent parms for performance 4K Movie streaming. connections_limit MUST be between 10-60. peer_timeout_seconds MUST be between 10-60. Output JSON: {\"connections_limit\":N,\"peer_timeout_seconds\":M}<|im_end|>\n<|im_start|>user\nactual Peers in Swarm %d - %sspeed=%.0fMB/s cpu=%d%% buf=%d%% peers=%d trend=%s<|im_end|>\n<|im_start|>assistant\n",
-		activeStats.TotalPeers, historyPrefix, currSpeedMBs, int(currentCPU), buffer, activeStats.ActivePeers, speedTrendStr,
+		"<|im_start|>system\nTune BitTorrent parms for performance 4K Movie streaming. connections_limit MUST be between 10-60. peer_timeout_seconds MUST be between 10-60. Output JSON: {\"connections_limit\":N,\"peer_timeout_seconds\":M}<|im_end|>\n<|im_start|>user\nactual Peers in Swarm %d file=%.1fGB - %sspeed=%.0fMB/s cpu=%d%% buf=%d%% peers=%d trend=%s<|im_end|>\n<|im_start|>assistant\n",
+		activeStats.TotalPeers, fileSizeGB, historyPrefix, currSpeedMBs, int(currentCPU), buffer, activeStats.ActivePeers, speedTrendStr,
 	)
 	_ = contextStr
-	_ = fileSizeGB
 
 	tweak, err := fetchAIJSON[AITweak](aiURL, prompt)
 	if err != nil {
@@ -333,8 +332,8 @@ func runTuningCycle(aiURL string) {
 		lastConns = newConns
 		lastTimeout = newTimeout
 
-		log.Printf("[AI-Pilot] Optimizer applying change: Conns(%d->%d) Timeout(%ds->%ds) [Metrics: %s] [Ctx: %s]",
-			oldConns, lastConns, oldTimeout, lastTimeout, currentSnap, contextStr)
+		log.Printf("[AI-Pilot] Optimizer applying change: Conns(%d->%d) Timeout(%ds->%ds) [Metrics: %s] [Ctx: %s] [File: %.1fGB]",
+			oldConns, lastConns, oldTimeout, lastTimeout, currentSnap, contextStr, fileSizeGB)
 	}
 
 }
