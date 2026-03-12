@@ -1141,8 +1141,9 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 			}
 			pumpStart = pumpChunk
 		}
+		capturedState := sharedState
 		safeGo(func() {
-			h.nativePump(pumpCtx, pumpStart)
+			h.nativePump(pumpCtx, pumpStart, capturedState)
 		})
 	default:
 		// If slots are full, it will fall back to per-request slots in Read
@@ -1152,7 +1153,8 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 
 // V226: nativePump reads continuously from the Native pipe and fills raCache.
 // FUSE Read() never touches the NativeReader directly — it reads from raCache.
-func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64) {
+// BUG-4: sharedState is passed so the defer can guard against orphan-delete.
+func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedState *NativePumpState) {
 	// V260: Capture reader at pump start — Release() cannot nil this
 	pumpReader := h.nativeReader
 	if pumpReader == nil {
@@ -1172,8 +1174,11 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64) {
 	}
 	defer func() {
 		h.mu.Lock()
-		// V258: Deregister from global registry (Safety double-check)
-		activePumps.Delete(h.path)
+		// BUG-4: Only delete if our sharedState is still the registered one.
+		// Without this check, pump A's defer could delete pump B's entry.
+		if val, ok := activePumps.Load(h.path); ok && val == sharedState {
+			activePumps.Delete(h.path)
+		}
 
 		if h.hasSlot {
 			select {
@@ -1679,8 +1684,9 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 								logger.Printf("[V238] FULL Aggressive Mode enabled on-the-fly for: %s", h.hash[:8])
 							}
 
+							upgradedState := sharedState
 							safeGo(func() {
-								h.nativePump(pumpCtx, off)
+								h.nativePump(pumpCtx, off, upgradedState)
 							})
 						default:
 							// Reserve full, stay in burst mode for now
@@ -1852,17 +1858,11 @@ DATA_READY:
 							return // Already cached
 						}
 
-						// Rate limit to prevent aggressive storms
-						ctx, cancel := context.WithTimeout(fuseCtx, 5*time.Second)
+										// BUG-3: prefetch outlives the FUSE call â use independent context
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 						defer cancel()
 						if err := globalRateLimiter.Acquire(ctx); err != nil {
 							return
-						}
-
-						select {
-						case <-fuseCtx.Done():
-							return
-						default:
 						}
 
 						fetchEnd := goStart + goSize - 1
@@ -2950,10 +2950,10 @@ func main() {
 	globalLockManager = NewLockManager(1 * time.Hour)
 
 	// V143-Performance: Initialize buffer pool with dynamic size based on Config
-	// V238: Pool size must match the doubled chunkSize used in nativePump (32MB default)
-	poolSize := int(globalConfig.ReadAheadBase) * 2
+	// BUG-5: pool size matches ReadAheadBase (doubled-chunk from V238 no longer used)
+	poolSize := int(globalConfig.ReadAheadBase)
 	if poolSize == 0 {
-		poolSize = 32 * 1024 * 1024
+		poolSize = 16 * 1024 * 1024
 	}
 	readBufferPool = &sync.Pool{
 		New: func() interface{} {
@@ -2961,7 +2961,7 @@ func main() {
 			return &buf
 		},
 	}
-	logger.Printf("ReadBufferPool initialized with size: %d bytes (matches 2x ReadAheadBase)", poolSize)
+	logger.Printf("ReadBufferPool initialized with size: %d bytes (matches ReadAheadBase)", poolSize)
 
 	// V79: Initialize httpClient with globalConfig timeout values
 	// This fixes the 11.8x performance degradation caused by hardcoded 5s timeout

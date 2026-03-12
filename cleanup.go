@@ -155,6 +155,11 @@ func (cm *CleanupManager) runCleanup() {
 		stats.MetadataPruned = cm.metaCache.CleanupExpired()
 	}
 
+	// LEAK-3: DirCache periodic cleanup (lazy eviction alone leaves unvisited dirs in memory)
+	if globalDirCache != nil {
+		globalDirCache.CleanupExpired()
+	}
+
 	// V238 Audit 1.A: Cleanup Native Bridge hashes
 	if cm.nativeBridge != nil {
 		stats.HashesRemoved = cm.nativeBridge.CleanupHashes()

@@ -46,8 +46,8 @@ type warmupWrite struct {
 
 // cachedHandle holds an open file descriptor with last-access tracking.
 type cachedHandle struct {
-	f        *os.File
-	lastUsed time.Time
+	f            *os.File
+	lastUsedNano atomic.Int64 // BUG-2: atomic to prevent race with handleReaper
 }
 
 // V264: sizeEntry stores the cached size of a warmup file with TTL.
@@ -58,8 +58,9 @@ type sizeEntry struct {
 
 // V265: tailRange tracks the actually-written byte range in a tail warmup file.
 type tailRange struct {
-	minOff int64 // lowest relative offset written
-	maxOff int64 // highest relative offset + bytes written
+	mu     sync.Mutex // BUG-1: protects minOff/maxOff against concurrent WriteTail/ReadTail
+	minOff int64      // lowest relative offset written
+	maxOff int64      // highest relative offset + bytes written
 }
 
 // DiskWarmupCache persists the first 128MB of each streamed file to SSD.
@@ -131,7 +132,7 @@ func (d *DiskWarmupCache) handleReaper() {
 		now := time.Now()
 		d.handles.Range(func(key, val interface{}) bool {
 			ch := val.(*cachedHandle)
-			if now.Sub(ch.lastUsed) > handleIdleMax {
+			if now.UnixNano()-ch.lastUsedNano.Load() > handleIdleMax.Nanoseconds() {
 				d.handles.Delete(key)
 				ch.f.Close()
 			}
@@ -143,18 +144,19 @@ func (d *DiskWarmupCache) handleReaper() {
 func (d *DiskWarmupCache) getHandle(path string) (*os.File, error) {
 	if val, ok := d.handles.Load(path); ok {
 		ch := val.(*cachedHandle)
-		ch.lastUsed = time.Now()
+		ch.lastUsedNano.Store(time.Now().UnixNano())
 		return ch.f, nil
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
-	ch := &cachedHandle{f: f, lastUsed: time.Now()}
+	ch := &cachedHandle{f: f}
+	ch.lastUsedNano.Store(time.Now().UnixNano())
 	if actual, loaded := d.handles.LoadOrStore(path, ch); loaded {
 		f.Close()
 		existing := actual.(*cachedHandle)
-		existing.lastUsed = time.Now()
+		existing.lastUsedNano.Store(time.Now().UnixNano())
 		return existing.f, nil
 	}
 	return f, nil
@@ -227,7 +229,9 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 			logger.Printf("[DiskWarmup] Error creating file: %v", err)
 			return
 		}
-		d.handles.Store(path, &cachedHandle{f: f, lastUsed: time.Now()})
+		newCh := &cachedHandle{f: f}
+		newCh.lastUsedNano.Store(time.Now().UnixNano())
+		d.handles.Store(path, newCh)
 		logger.Printf("[DiskWarmup] STARTING %s at offset %d", filepath.Base(path), off)
 	}
 
@@ -346,7 +350,10 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 
 	if val, ok := d.tailCoverage.Load(path); ok {
 		tr := val.(*tailRange)
-		if tr.minOff == 0 && tr.maxOff >= tailWarmupSize {
+		tr.mu.Lock()
+		done := tr.minOff == 0 && tr.maxOff >= tailWarmupSize
+		tr.mu.Unlock()
+		if done {
 			return
 		}
 	} else if fi, err := os.Stat(path); err == nil && fi.Size() >= tailWarmupSize {
@@ -362,7 +369,9 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 		if err != nil {
 			return
 		}
-		d.handles.Store(path, &cachedHandle{f: f, lastUsed: time.Now()})
+		tailCh := &cachedHandle{f: f}
+		tailCh.lastUsedNano.Store(time.Now().UnixNano())
+		d.handles.Store(path, tailCh)
 		logger.Printf("[DiskWarmup] TAIL STARTING %s at relOffset %d", filepath.Base(path), relOffset)
 	}
 
@@ -377,12 +386,14 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 	endOff := relOffset + int64(n)
 	if val, ok := d.tailCoverage.Load(path); ok {
 		tr := val.(*tailRange)
+		tr.mu.Lock()
 		if relOffset < tr.minOff {
 			tr.minOff = relOffset
 		}
 		if endOff > tr.maxOff {
 			tr.maxOff = endOff
 		}
+		tr.mu.Unlock()
 	} else {
 		d.tailCoverage.Store(path, &tailRange{minOff: relOffset, maxOff: endOff})
 	}
@@ -403,7 +414,10 @@ func (d *DiskWarmupCache) ReadTail(hash string, fileID int, buf []byte, absolute
 	readEnd := relOffset + int64(len(buf))
 	if val, ok := d.tailCoverage.Load(path); ok {
 		tr := val.(*tailRange)
-		if relOffset < tr.minOff || readEnd > tr.maxOff {
+		tr.mu.Lock()
+		miss := relOffset < tr.minOff || readEnd > tr.maxOff
+		tr.mu.Unlock()
+		if miss {
 			return 0, nil
 		}
 	} else {
