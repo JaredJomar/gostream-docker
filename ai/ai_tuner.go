@@ -76,8 +76,11 @@ func (t *AITweak) Sanitize() {
 	if t.ConnectionsLimit > 60 {
 		t.ConnectionsLimit = 60
 	}
-	if t.PeerTimeout < 15 {
-		t.PeerTimeout = 15
+	if t.PeerTimeout < 10 {
+		t.PeerTimeout = 10
+	}
+	if t.PeerTimeout > 60 {
+		t.PeerTimeout = 60
 	}
 }
 
@@ -302,13 +305,13 @@ func runTuningCycle(aiURL string) {
 
 	// Qwen3 ChatML template con Few-Shot Examples (Full Data)
 	prompt := fmt.Sprintf(
-		"<|im_start|>system\nBitTorrent Optimizer. Examples:\n" +
-		"- Peers:2, Total:10, Size:2GB, Speed:0, CPU:25 -> {\"connections_limit\":5,\"peer_timeout_seconds\":90}\n" +
-		"- Peers:50, Total:150, Size:40GB, Speed:15, CPU:30 -> {\"connections_limit\":50,\"peer_timeout_seconds\":15}\n" +
-		"- Peers:40, Total:80, Size:15GB, Speed:10, CPU:90 -> {\"connections_limit\":12,\"peer_timeout_seconds\":20}\n" +
-		"Output ONLY JSON.<|im_end|>\n" +
-		"<|im_start|>user\nPeers:%d, Total:%d, Size:%.1fGB, Speed:%.1fMB/s, CPU:%d%%, Buf:%d%%, History:%s, Trend:%s<|im_end|>\n" +
-		"<|im_start|>assistant\n",
+		"<|im_start|>system\nBitTorrent Optimizer. Examples:\n"+
+			"- Peers:2, Total:10, Size:2GB, Speed:0, CPU:25 -> {\"connections_limit\":5,\"peer_timeout_seconds\":60}\n"+
+			"- Peers:50, Total:150, Size:40GB, Speed:15, CPU:30 -> {\"connections_limit\":50,\"peer_timeout_seconds\":15}\n"+
+			"- Peers:40, Total:80, Size:15GB, Speed:10, CPU:90 -> {\"connections_limit\":12,\"peer_timeout_seconds\":20}\n"+
+			"Output ONLY JSON. Use 2-digit seconds for timeout.<|im_end|>\n"+
+			"<|im_start|>user\nPeers:%d, Total:%d, Size:%.1fGB, Speed:%.1fMB/s, CPU:%d%%, Buf:%d%%, History:%s, Trend:%s<|im_end|>\n"+
+			"<|im_start|>assistant\n",
 		activeStats.ActivePeers, activeStats.TotalPeers, fileSizeGB, currSpeedMBs, int(currentCPU), buffer, historyStr, speedTrendStr,
 	)
 
@@ -404,13 +407,32 @@ number ::= [0-9]+`
 	if trimmed == "" {
 		return nil, fmt.Errorf("empty AI response")
 	}
-
 	log.Printf("[AI-Pilot] RAW: %q | Latency: %v", trimmed, time.Since(start))
 
-	var result T
-	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
-		return nil, fmt.Errorf("JSON unmarshal error: %v", err)
+	// Pre-processing: Tronca i numeri lunghi (>2 cifre) alle prime due cifre
+	// Esempio: "130000000" -> "13". Questo risolve le allucinazioni di zeri del modello 0.6B.
+	cleaned := trimmed
+	for _, key := range []string{"\"connections_limit\":", "\"peer_timeout_seconds\":"} {
+		if idx := strings.Index(cleaned, key); idx != -1 {
+			vStart := idx + len(key)
+			for vStart < len(cleaned) && (cleaned[vStart] == ' ' || cleaned[vStart] == ':') {
+				vStart++
+			}
+			vEnd := vStart
+			for vEnd < len(cleaned) && (cleaned[vEnd] >= '0' && cleaned[vEnd] <= '9') {
+				vEnd++
+			}
+			if vEnd-vStart > 2 {
+				cleaned = cleaned[:vStart] + cleaned[vStart:vStart+2] + cleaned[vEnd:]
+			}
+		}
 	}
+
+	var result T
+	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		return nil, fmt.Errorf("AI decode error: %v (Original: %q)", err, trimmed)
+	}
+
 	return &result, nil
 }
 
