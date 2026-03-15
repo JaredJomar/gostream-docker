@@ -71,7 +71,7 @@ MOVIES_DIR   = os.path.join(_cfg.get('physical_source_path', '/mnt/torrserver'),
 TMDB_API_KEY = _cfg.get('tmdb_api_key', '')
 SECTION_ID   = _cfg.get('plex', {}).get('library_id', 0)
 
-TORRENTIO_BASE   = "https://torrentio.strem.fun"
+TORRENTIO_BASE   = _cfg.get('torrentio_url', 'https://torrentio.strem.fun')
 TORRENTIO_CONFIG = "sort=qualitysize|qualityfilter=480p,720p,scr,cam"
 
 TMDB_BASE          = "https://api.themoviedb.org/3"

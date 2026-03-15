@@ -121,7 +121,8 @@ type Config struct {
 		LibraryID   int    `json:"library_id"`
 		TVLibraryID int    `json:"tv_library_id"`
 	} `json:"plex"`
-	TMDBAPIKey string `json:"tmdb_api_key"`
+	TMDBAPIKey   string `json:"tmdb_api_key"`
+	TorrentioURL string `json:"torrentio_url"` // Torrentio base URL (used when Prowlarr is disabled)
 
 	// --- Prowlarr Indexer ---
 	Prowlarr struct {
@@ -172,6 +173,7 @@ func LoadConfig() Config {
 			WatchlistSync: WatchlistSyncConfig{Enabled: true, IntervalHours: 1},
 		},
 
+		TorrentioURL:    "https://torrentio.strem.fun",
 		GoStormBaseURL:  "http://127.0.0.1:8090",
 		AIURL:           "http://127.0.0.1:8085", // Default Pi internal AI port (V1.4.5)
 		ProxyListenPort: 8080,

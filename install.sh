@@ -375,7 +375,6 @@ collect_apis() {
     print_header "[3/5] External APIs"
 
     ask "TMDB API key (optional — leave empty to skip movie sync)" "" TMDB_API_KEY
-    ask "Torrentio base URL" "https://torrentio.strem.fun" TORRENTIO_URL
 
     if [ -z "$TMDB_API_KEY" ]; then
         print_warn "No TMDB key entered. Movie sync (gostorm-sync-complete.py) will not function."

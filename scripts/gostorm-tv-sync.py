@@ -108,7 +108,7 @@ class GoStormTV:
         # API Keys
         self.TMDB_API_KEY = _cfg.get('tmdb_api_key', '')
         self.TMDB_BASE_URL = "https://api.themoviedb.org/3"
-        self.TORRENTIO_BASE_URL = "https://torrentio.strem.fun"
+        self.TORRENTIO_BASE_URL = _cfg.get('torrentio_url', 'https://torrentio.strem.fun')
 
         # Processing settings
         self.FULLPACK_PRIORITY_BONUS = 500  # Bonus per fullpack nel sorting (High Priority)

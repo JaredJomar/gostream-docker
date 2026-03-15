@@ -160,7 +160,8 @@ type NativeReader struct {
 	cancelFunc   context.CancelFunc
 	closed       bool
 	lastActivity time.Time
-	interrupted  atomic.Bool // V286: set by Interrupt(), cleared by next startStream
+	interrupted        atomic.Bool // V286: set by Interrupt(), cleared by next startStream
+	pipeReaderAtomic   atomic.Pointer[io.PipeReader]
 }
 
 // ErrInterrupted is returned by ReadAt when the pipe was closed by Interrupt().
@@ -251,10 +252,7 @@ func (r *NativeReader) ReadAt(p []byte, off int64) (n int, err error) {
 // Sets interrupted flag so ReadAt returns ErrInterrupted reliably.
 func (r *NativeReader) Interrupt() {
 	r.interrupted.Store(true)
-	r.mu.Lock()
-	pr := r.pipeReader
-	r.mu.Unlock()
-	if pr != nil {
+	if pr := r.pipeReaderAtomic.Load(); pr != nil {
 		pr.Close() // Reader side close is enough to unblock ReadFull
 	}
 }
@@ -268,6 +266,7 @@ func (r *NativeReader) startStream(off int64) error {
 
 	pr, pw := io.Pipe()
 	r.pipeReader = pr
+	r.pipeReaderAtomic.Store(pr)
 	r.pipeWriter = pw
 	r.offset = off
 
@@ -305,6 +304,7 @@ func (r *NativeReader) closeStream() {
 	// Small delay to allow context propagation? No, BoltDB/RAM is fast.
 
 	if r.pipeReader != nil {
+		r.pipeReaderAtomic.Store(nil)
 		r.pipeReader.Close()
 		r.pipeReader = nil
 	}

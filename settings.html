@@ -714,11 +714,19 @@
                     </div>
 
                     <div class="form-section">
-                        <div class="form-section-title">Prowlarr Indexer</div>
-                        <div class="switch-item">
+                        <div class="form-section-title">Indexer</div>
+                        <div class="form-grid">
+                            <div class="form-group" style="grid-column: 1 / -1;">
+                                <label>Torrentio URL</label>
+                                <input type="text" name="torrentio_url" id="torrentio_url_input"
+                                    placeholder="https://torrentio.strem.fun">
+                                <div class="hint" id="torrentio_url_hint">Torrentio base URL (used when Prowlarr is disabled)</div>
+                            </div>
+                        </div>
+                        <div class="switch-item" style="margin-top: 12px;">
                             <span>Enable Prowlarr</span>
                             <label class="switch"><input type="checkbox" name="prowlarr_enabled"
-                                    data-nested="prowlarr.enabled"><span class="slider"></span></label>
+                                    data-nested="prowlarr.enabled" onchange="updateProwlarrState()"><span class="slider"></span></label>
                         </div>
                         <div class="hint" style="margin-bottom: 12px;">Use Prowlarr as indexer; if disabled, uses
                             Torrentio</div>
@@ -1082,6 +1090,20 @@
             portHint.style.color = enabled ? '#b45309' : '';
         }
 
+        // --- Prowlarr state → Torrentio URL readonly ---
+        function updateProwlarrState() {
+            const enabled = document.querySelector('[name="prowlarr_enabled"]')?.checked;
+            const urlInput = document.getElementById('torrentio_url_input');
+            const urlHint = document.getElementById('torrentio_url_hint');
+            if (!urlInput) return;
+            urlInput.readOnly = enabled;
+            urlInput.style.opacity = enabled ? '0.5' : '1';
+            urlHint.textContent = enabled
+                ? 'Torrentio URL not used when Prowlarr is enabled'
+                : 'Torrentio base URL (used when Prowlarr is disabled)';
+            urlHint.style.color = enabled ? '#b45309' : '';
+        }
+
         // --- Adaptive Shield state (disabled when ResponsiveMode is OFF) ---
         function updateAdaptiveShieldState() {
             const responsive = document.querySelector('[name="responsiveMode"]');
@@ -1203,7 +1225,7 @@
             'retry_delay_ms', 'gostorm_url', 'rescue_grace_period_seconds',
             'rescue_cooldown_hours', 'metrics_port', 'disk_warmup_quota_gb',
             'warmup_head_size_mb', 'log_level', 'proxy_listen_port', 'blocklist_url',
-            'tmdb_api_key'
+            'tmdb_api_key', 'torrentio_url'
         ];
 
         async function loadEngine() {
@@ -1246,6 +1268,7 @@
                     form.querySelector('[data-nested="prowlarr.api_key"]').value = pr.api_key || pr.APIKey || "";
                     form.querySelector('[data-nested="prowlarr.url"]').value = pr.url || pr.URL || "";
                 }
+                updateProwlarrState();
                 markCouplingLoaded();
             } catch (e) { console.error("Engine load error", e); }
         }
@@ -1263,7 +1286,8 @@
                 if (v === null || v === "") return;
 
                 if (k === 'log_level' || k === 'gostorm_url' || k === 'blocklist_url' ||
-                    k === 'physical_source_path' || k === 'fuse_mount_path' || k === 'tmdb_api_key') {
+                    k === 'physical_source_path' || k === 'fuse_mount_path' || k === 'tmdb_api_key' ||
+                    k === 'torrentio_url') {
                     data[k] = v;
                 } else if (k.includes('timeout_seconds')) {
                     const parsed = parseFloat(v);
