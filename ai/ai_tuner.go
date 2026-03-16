@@ -324,6 +324,7 @@ func runTuningCycle(aiURL string) {
 			return
 		}
 		log.Printf("[AI-Pilot] Communication Delay: %v", err)
+		go resetLlamaCache(aiURL)
 		return
 	}
 

@@ -2222,16 +2222,28 @@ func (c *ReadAheadCache) Get(p string, off, end int64) []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key := raChunkKey(p, off)
-	if b, ok := s.buffers[key]; ok && off >= b.start && end <= b.end {
+	if b, ok := s.buffers[key]; ok && off >= b.start && off <= b.end {
 		// V244-Fix: Update activity timestamp atomically (Lock-Free)
 		atomic.StoreInt64(&b.lastAccess, time.Now().UnixNano())
-		// V274-Fix: Defensive copy — channel-based pool evicts buffers immediately,
-		// returning a sub-slice reference causes use-after-free if eviction races the caller.
-		// Put() already copies on write; Get() must copy on read for symmetric safety.
-		src := b.data[off-b.start : end-b.start+1]
-		out := make([]byte, len(src))
-		copy(out, src)
-		return out
+		if end <= b.end {
+			// Fast path: entirely within one chunk.
+			// V274-Fix: Defensive copy — channel-based pool evicts buffers immediately,
+			// returning a sub-slice reference causes use-after-free if eviction races the caller.
+			src := b.data[off-b.start : end-b.start+1]
+			out := make([]byte, len(src))
+			copy(out, src)
+			return out
+		}
+		// V247c-Fix: Cross-boundary read — 'end' falls in the next chunk.
+		// Previously this caused a spurious cache miss and a blocking FetchBlock call
+		// every time a FUSE read straddled a 16MB chunk boundary.
+		if b2, ok2 := s.buffers[raChunkKey(p, end)]; ok2 && b2.start == b.end+1 && b2.end >= end {
+			atomic.StoreInt64(&b2.lastAccess, time.Now().UnixNano())
+			out := make([]byte, end-off+1)
+			n1 := copy(out, b.data[off-b.start:])
+			copy(out[n1:], b2.data[:end-b2.start+1])
+			return out
+		}
 	}
 	return nil
 }
@@ -2253,11 +2265,20 @@ func (c *ReadAheadCache) CopyTo(p string, off, end int64, dest []byte) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key := raChunkKey(p, off)
-	if b, ok := s.buffers[key]; ok && off >= b.start && end <= b.end {
+	if b, ok := s.buffers[key]; ok && off >= b.start && off <= b.end {
 		atomic.StoreInt64(&b.lastAccess, time.Now().UnixNano())
-		src := b.data[off-b.start : end-b.start+1]
-		n := copy(dest, src)
-		return n
+		if end <= b.end {
+			// Fast path: entirely within one chunk.
+			src := b.data[off-b.start : end-b.start+1]
+			return copy(dest, src)
+		}
+		// V247c-Fix: Cross-boundary read — same logic as Get().
+		if b2, ok2 := s.buffers[raChunkKey(p, end)]; ok2 && b2.start == b.end+1 && b2.end >= end {
+			atomic.StoreInt64(&b2.lastAccess, time.Now().UnixNano())
+			n1 := copy(dest, b.data[off-b.start:])
+			n2 := copy(dest[n1:], b2.data[:end-b2.start+1])
+			return n1 + n2
+		}
 	}
 	return 0
 }
@@ -2268,11 +2289,11 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 	sessID := c.currentSessionID
 	// V247-Fix: If we are caching for the ACTIVE stream, force the current session ID.
 	// This prevents race conditions where a pump started during Open might use an old ID.
-	if p == c.activePath {
-		// Use currentSessionID
-	} else {
-		// For background streams/scans, we use a special "background" ID (0)
-		// or just the current one. Let's stick to current but tag as potentially stale.
+	// V247b-Fix: Background pumps (stale/lingering after context switch) must use sessID=0
+	// so triggerGlobalEviction can correctly identify and evict them. Without this, a
+	// lingering pump writes chunks tagged with the NEW session ID → eviction preserves them.
+	if p != c.activePath {
+		sessID = 0
 	}
 	c.muContext.Unlock()
 
@@ -2311,9 +2332,17 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 		atomic.AddInt64(&c.used, -int64(len(old.data)))
 		// V294: Recycle old data
 		c.recycle(old.data)
-	} else {
-		shard.order = append(shard.order, key)
+		// V247d-Fix: Promote to MRU end of order on overwrite (true LRU behavior).
+		// Previously, refreshed chunks kept their original FIFO position and were
+		// evicted first despite being recently written.
+		for i, k := range shard.order {
+			if k == key {
+				shard.order = append(shard.order[:i], shard.order[i+1:]...)
+				break
+			}
+		}
 	}
+	shard.order = append(shard.order, key)
 
 	// 2. Add new data
 	shard.total += dataSize
@@ -2412,14 +2441,7 @@ func (c *ReadAheadCache) triggerGlobalEviction(activePath string, activeSessionI
 	// V250: Increased stale threshold to 120s for 4K stability
 	staleThreshold := (120 * time.Second).Nanoseconds()
 
-	for _, s := range c.shards {
-		// V249: NEVER block on a shard lock during global eviction.
-		// If the shard is busy, skip it. We have 32 shards to choose from.
-		if !s.mu.TryLock() {
-			continue
-		}
-
-		// Scan order from oldest to newest
+	evictShard := func(s *raShard) {
 		var newOrder []string
 		for _, key := range s.order {
 			keep := true
@@ -2456,6 +2478,26 @@ func (c *ReadAheadCache) triggerGlobalEviction(activePath string, activeSessionI
 			}
 		}
 		s.order = newOrder
+	}
+
+	skipped := 0
+	for _, s := range c.shards {
+		// V249: NEVER block on a shard lock during global eviction.
+		// If the shard is busy, skip it. We have 32 shards to choose from.
+		if !s.mu.TryLock() {
+			skipped++
+			continue
+		}
+		evictShard(s)
+		s.mu.Unlock()
+	}
+
+	// V247e-Fix: If all shards were busy under extreme load, force a blocking eviction
+	// on the first shard to guarantee memory is released and prevent budget overflow.
+	if skipped == len(c.shards) {
+		s := c.shards[0]
+		s.mu.Lock()
+		evictShard(s)
 		s.mu.Unlock()
 	}
 }
