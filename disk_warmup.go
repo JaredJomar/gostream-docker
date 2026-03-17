@@ -47,7 +47,8 @@ type warmupWrite struct {
 // cachedHandle holds an open file descriptor with last-access tracking.
 type cachedHandle struct {
 	f            *os.File
-	lastUsedNano atomic.Int64 // BUG-2: atomic to prevent race with handleReaper
+	lastUsedNano atomic.Int64 // atomic to prevent race with handleReaper
+	closed       atomic.Bool  // set by closeHandle before f.Close() so writeWorker can detect stale handles
 }
 
 // V264: sizeEntry stores the cached size of a warmup file with TTL.
@@ -163,7 +164,9 @@ func (d *DiskWarmupCache) getHandle(path string) (*os.File, error) {
 
 func (d *DiskWarmupCache) closeHandle(path string) {
 	if val, ok := d.handles.LoadAndDelete(path); ok {
-		val.(*cachedHandle).f.Close()
+		ch := val.(*cachedHandle)
+		ch.closed.Store(true) // mark before Close so writeWorker can detect stale handle
+		ch.f.Close()
 	}
 }
 
@@ -238,6 +241,13 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 	if err != nil {
 		return
 	}
+	// Guard: RemoveHash may have closed this handle between getHandle and WriteAt
+	if val, ok := d.handles.Load(path); ok {
+		if val.(*cachedHandle).closed.Load() {
+			logger.Printf("[DiskWarmup] Write skipped: handle closed for %s", filepath.Base(path))
+			return
+		}
+	}
 
 	var prevSize int64
 	if val, ok := d.sizeCache.Load(path); ok {
@@ -246,7 +256,11 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 		prevSize = fi.Size()
 	}
 
-	n, _ := f.WriteAt(data, off)
+	n, err := f.WriteAt(data, off)
+	if err != nil {
+		logger.Printf("[DiskWarmup] WriteAt error for %s: %v", filepath.Base(path), err)
+		return
+	}
 
 	currentSize := off + int64(n)
 	if currentSize > prevSize {
@@ -377,6 +391,13 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 	f, err := d.getHandle(path)
 	if err != nil {
 		return
+	}
+	// Guard: RemoveHash may have closed this handle between getHandle and WriteAt
+	if val, ok := d.handles.Load(path); ok {
+		if val.(*cachedHandle).closed.Load() {
+			logger.Printf("[DiskWarmup] Write skipped (tail): handle closed for %s", filepath.Base(path))
+			return
+		}
 	}
 
 	n, _ := f.WriteAt(data, relOffset)
