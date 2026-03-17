@@ -129,6 +129,7 @@ var readBufferPool *sync.Pool
 // Matches "imdb://tt1234567" inside the Guid array (capital G) without touching
 // the lowercase "guid" string field — avoids json UnmarshalTypeError.
 var reImdbID = regexp.MustCompile(`"imdb://(tt\d+)"`)
+var reEmptyNumber = regexp.MustCompile(`"(\w+)":\s*,`)
 
 // V226: Track active handles for Idle Reader Cleanup (Unified)
 var activeHandles sync.Map // key: *MkvHandle, value: bool
@@ -2559,12 +2560,21 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 	// V239-Debug: Log entry to confirm connectivity
 	logger.Printf("[PLEX] Webhook connection from %s", r.RemoteAddr)
 
-	if err := r.ParseMultipartForm(10 * 1024 * 1024); err != nil {
-		http.Error(w, "Bad request", 400)
-		return
+	var payloadStr string
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+		if err != nil {
+			http.Error(w, "Bad request", 400)
+			return
+		}
+		payloadStr = string(body)
+	} else {
+		if err := r.ParseMultipartForm(10 * 1024 * 1024); err != nil {
+			http.Error(w, "Bad request", 400)
+			return
+		}
+		payloadStr = r.FormValue("payload")
 	}
-
-	payloadStr := r.FormValue("payload")
 	if payloadStr == "" {
 		return
 	}
@@ -2591,8 +2601,28 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		} `json:"Metadata"`
 	}
 
-	if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
+	// Sanitize empty numeric fields produced by Jellyfin templates (e.g. "year":, → "year":0,)
+	sanitized := reEmptyNumber.ReplaceAllString(payloadStr, `"$1":0`)
+	if err := json.Unmarshal([]byte(sanitized), &payload); err != nil {
 		return
+	}
+
+	// Normalize Jellyfin event names to Plex-style
+	switch payload.Event {
+	case "PlaybackStart":
+		payload.Event = "media.play"
+	case "PlaybackStop":
+		payload.Event = "media.stop"
+	case "PlaybackProgress":
+		payload.Event = "media.resume"
+	}
+
+	// Normalize Jellyfin ItemType values to Plex-style ("Movie"→"movie", "Episode"→"show")
+	switch payload.Metadata.LibrarySectionType {
+	case "Movie":
+		payload.Metadata.LibrarySectionType = "movie"
+	case "Episode":
+		payload.Metadata.LibrarySectionType = "show"
 	}
 
 	// V256: Only process Video libraries (movie/show). Ignore music (artist) and others.

@@ -24,7 +24,7 @@ This is not a torrent client with a media server bolted on. The FUSE filesystem 
 - Add a title to your **Plex cloud watchlist** and it shows up in your library within the hour.
 - **NAT-PMP** for WireGuard setups: GoStream requests an inbound port mapping from the VPN gateway and installs `iptables REDIRECT` rules, all without a restart.
 - A **peer blocklist** of ~700,000 IP ranges is downloaded on startup and refreshed every 24 hours, injected into the torrent engine before any connection is made.
-- **Plex Webhook integration**: `media.play` triggers Priority Mode with aggressive piece prioritization. IMDB-ID is extracted from the raw payload via regex, so it works even when Plex sends localized titles.
+- **Plex & Jellyfin Webhook integration**: `media.play` triggers Priority Mode with aggressive piece prioritization. IMDB-ID is extracted from the raw payload via regex, so it works even when the media server sends localized titles. Jellyfin is supported natively via JSON body — no code change, no plugin hacks.
 - The **embedded Control Panel** at `:8096/control` lets you adjust all FUSE and engine settings live, compiled directly into the binary.
 - The **Health Monitor Dashboard** shows a real-time speed graph, an active stream panel with movie poster and quality badges, sync controls, and system stats.
 - Everything ships as a **single binary**: GoStorm engine, GoStream, metrics, control panel, and webhook receiver in one `gostream` executable.
@@ -134,7 +134,7 @@ On a standard virtual filesystem, these IDs are random and change every time the
 
 1. You press Play on Infuse (Apple TV) -> Infuse requests the file from Plex/Jellyfin
 2. Plex/Jellyfin reads the file from GoStream's virtual filesystem
-3. Plex/Jellyfin sends a webhook to GoStream: "user started playing *this* film"
+3. Plex or Jellyfin sends a webhook to GoStream: "user started playing *this* film"
 4. GoStream identifies the torrent from the IMDB ID and switches to **Priority Mode**: all bandwidth focuses on the film you are watching, background activity is paused
 5. Bytes flow: BitTorrent peers -> GoStream RAM -> Plex/Jellyfin -> Infuse -> your TV
 6. If you seek, GoStream jumps directly to that position in the torrent with no re-buffering from the start
@@ -208,21 +208,36 @@ The **tail cache** stores the last 16 MB separately. MKV files keep their Cues (
 
 The default quota is 32 GB with LRU eviction by write time, enough for around 150 films. Media server library scans read the first 1 MB of every file, which is enough to populate the head cache automatically — no manual warming needed.
 
-### 3. Plex Webhook Integration & Smart Streaming
+### 3. Webhook Integration & Smart Streaming
 
-GoStream embeds a webhook receiver at `:8096/plex-webhook`. When Plex sends a `media.play` event:
+GoStream embeds a webhook receiver at `:8096/plex/webhook` (also `/webhook`). Both **Plex** and **Jellyfin** are supported. When a `media.play` event arrives:
 
 1. **IMDB extraction** — Extracts the IMDB ID from the raw JSON payload using `imdb://(tt\d+)` regex *before* `json.Unmarshal`. This is intentional: Plex uses a non-standard `Guid` array format that causes a silent `UnmarshalTypeError` when decoded normally.
 2. **Priority Mode** — GoStorm is instructed to aggressively prioritize pieces covering the exact byte range being played.
 3. **Tail freeze** — The MKV Cues segment is not evicted while the film is playing.
 4. **Fast-drop on stop** — Torrent retention shrinks from 60 s to 10 s, freeing peers immediately.
 
-> 💡 **Why IMDB-ID?** Plex sends titles in the user's display language (`"den stygge stesøsteren"` instead of `"The Ugly Stepsister"`). Fuzzy matching fails. IMDB ID is language-independent.
+> 💡 **Why IMDB-ID?** Media servers send titles in the user's display language (`"den stygge stesøsteren"` instead of `"The Ugly Stepsister"`). Fuzzy matching fails. IMDB ID is language-independent.
 
-**Configure in Plex**: Settings → Webhooks → Add Webhook:
+**Plex** — Settings → Webhooks → Add Webhook:
 ```
-http://<your-pi-ip>:8096/plex-webhook
+http://<your-pi-ip>:8096/plex/webhook
 ```
+
+**Jellyfin** — Install the [Webhook plugin](https://github.com/jellyfin/jellyfin-plugin-webhook), then add one webhook with events `PlaybackStart`, `PlaybackStop`, `PlaybackProgress`:
+
+| Field | Value |
+|-------|-------|
+| URL | `http://<your-pi-ip>:8096/plex/webhook` |
+| Header Key | `Content-Type` |
+| Header Value | `application/json` |
+
+Template:
+```
+{"event":"{{NotificationType}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{SeriesName}}}","librarySectionType":"{{ItemType}}","guid":"imdb://{{Provider_imdb}}","Guid":[{"id":"imdb://{{Provider_imdb}}"}]}}
+```
+
+GoStream normalizes Jellyfin's native event names (`PlaybackStart`→`media.play`, `PlaybackStop`→`media.stop`) and item types (`Movie`→`movie`, `Episode`→`show`) internally.
 
 ### 4. Adaptive Responsive Shield
 
@@ -375,19 +390,26 @@ sudo systemctl start gostream health-monitor
 
 
 <details>
-<summary><b>Step 1 — Configure the Plex Webhook</b></summary>
-
-In Plex Web: **Settings → Webhooks → Add Webhook**:
-
-```
-http://192.168.1.2:8096/plex-webhook
-```
+<summary><b>Step 1 — Configure the Webhook (Plex or Jellyfin)</b></summary>
 
 Required for Priority Mode (bitrate boost during playback), fast-drop on stop, and IMDB-ID-based file matching.
 
+**Plex** — Settings → Webhooks → Add Webhook:
+```
+http://192.168.1.2:8096/plex/webhook
+```
+
+**Jellyfin** — Install the Webhook plugin, add one webhook (events: `PlaybackStart`, `PlaybackStop`, `PlaybackProgress`):
+- URL: `http://192.168.1.2:8096/plex/webhook`
+- Header: Key `Content-Type` / Value `application/json`
+- Template:
+```
+{"event":"{{NotificationType}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{SeriesName}}}","librarySectionType":"{{ItemType}}","guid":"imdb://{{Provider_imdb}}","Guid":[{"id":"imdb://{{Provider_imdb}}"}]}}
+```
+
 Test connectivity:
 ```bash
-curl -X POST http://192.168.1.2:8096/plex-webhook \
+curl -X POST http://192.168.1.2:8096/plex/webhook \
   -H 'Content-Type: application/json' \
   -d '{"event":"media.play"}'
 ```
@@ -433,7 +455,7 @@ The script fetches popular films from TMDB, finds the best available torrent for
 2. FUSE Open() triggers Wake() — GoStorm activates the torrent
 3. Plex/Jellyfin metadata probes → served from SSD warmup cache if enabled, otherwise from the torrent pump
 4. Plex/Jellyfin probes MKV Cues at end → served from SSD tail cache if enabled
-5. Plex sends media.play webhook → GoStream activates Priority Mode
+5. Plex or Jellyfin sends media.play webhook → GoStream activates Priority Mode
 6. Streaming reads → served from Read-Ahead Cache or Native Bridge pump
 7. Playback begins (0.1–0.5 s with warmup, 2–4 s cold) ✨
 ```
@@ -988,13 +1010,13 @@ sudo chown pi:pi /mnt/gostream-mkv-virtual
 </details>
 
 <details>
-<summary><b>Plex webhook not triggering Priority Mode</b></summary>
+<summary><b>Webhook not triggering Priority Mode (Plex or Jellyfin)</b></summary>
 
 Verify connectivity:
 ```bash
-curl -v http://127.0.0.1:8096/plex-webhook \
+curl -v http://127.0.0.1:8096/plex/webhook \
   -X POST -H 'Content-Type: application/json' \
-  -d '{"event":"media.play","Metadata":{"guid":"plex://movie/..."}}'
+  -d '{"event":"media.play","Metadata":{"librarySectionType":"movie","guid":"imdb://tt1234567","Guid":[{"id":"imdb://tt1234567"}]}}'
 ```
 
 Check logs:
@@ -1002,7 +1024,9 @@ Check logs:
 grep -i webhook /home/pi/logs/gostream.log | tail -20
 ```
 
-If webhook fires but IMDB matching fails (common with non-English Plex), verify the raw payload contains `imdb://tt\d+`. GoStream uses regex on the raw JSON string.
+If the connection appears in logs but IMDB matching fails, verify the raw payload contains `imdb://tt\d+`. GoStream uses regex on the raw JSON string — it works even with localized titles.
+
+**Jellyfin-specific**: if you see no log entry at all, confirm the `Content-Type` header is set correctly (Key: `Content-Type`, Value: `application/json`). Jellyfin does not send the request when the Content-Type override is malformed.
 
 </details>
 
