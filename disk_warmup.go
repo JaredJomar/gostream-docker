@@ -141,11 +141,11 @@ func (d *DiskWarmupCache) handleReaper() {
 	}
 }
 
-func (d *DiskWarmupCache) getHandle(path string) (*os.File, error) {
+func (d *DiskWarmupCache) getHandle(path string) (*cachedHandle, error) {
 	if val, ok := d.handles.Load(path); ok {
 		ch := val.(*cachedHandle)
 		ch.lastUsedNano.Store(time.Now().UnixNano())
-		return ch.f, nil
+		return ch, nil
 	}
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
@@ -157,9 +157,9 @@ func (d *DiskWarmupCache) getHandle(path string) (*os.File, error) {
 		f.Close()
 		existing := actual.(*cachedHandle)
 		existing.lastUsedNano.Store(time.Now().UnixNano())
-		return existing.f, nil
+		return existing, nil
 	}
-	return f, nil
+	return ch, nil
 }
 
 func (d *DiskWarmupCache) closeHandle(path string) {
@@ -237,26 +237,23 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 		logger.Printf("[DiskWarmup] STARTING %s at offset %d", filepath.Base(path), off)
 	}
 
-	f, err := d.getHandle(path)
+	ch, err := d.getHandle(path)
 	if err != nil {
 		return
 	}
-	// Guard: RemoveHash may have closed this handle between getHandle and WriteAt
-	if val, ok := d.handles.Load(path); ok {
-		if val.(*cachedHandle).closed.Load() {
-			logger.Printf("[DiskWarmup] Write skipped: handle closed for %s", filepath.Base(path))
-			return
-		}
+	if ch.closed.Load() {
+		logger.Printf("[DiskWarmup] Write skipped: handle closed for %s", filepath.Base(path))
+		return
 	}
 
 	var prevSize int64
 	if val, ok := d.sizeCache.Load(path); ok {
 		prevSize = val.(sizeEntry).size
-	} else if fi, err := f.Stat(); err == nil {
+	} else if fi, err := ch.f.Stat(); err == nil {
 		prevSize = fi.Size()
 	}
 
-	n, err := f.WriteAt(data, off)
+	n, err := ch.f.WriteAt(data, off)
 	if err != nil {
 		logger.Printf("[DiskWarmup] WriteAt error for %s: %v", filepath.Base(path), err)
 		return
@@ -320,7 +317,7 @@ func (d *DiskWarmupCache) ReadAt(hash string, fileID int, buf []byte, off int64)
 	}
 	path := d.filePath(hash, fileID)
 
-	f, err := d.getHandle(path)
+	ch, err := d.getHandle(path)
 	if err != nil {
 		return 0, nil
 	}
@@ -338,7 +335,7 @@ func (d *DiskWarmupCache) ReadAt(hash string, fileID int, buf []byte, off int64)
 		buf = buf[:avail]
 	}
 
-	n, err := f.ReadAt(buf, off)
+	n, err := ch.f.ReadAt(buf, off)
 	return n, err
 }
 
@@ -388,19 +385,16 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 		logger.Printf("[DiskWarmup] TAIL STARTING %s at relOffset %d", filepath.Base(path), relOffset)
 	}
 
-	f, err := d.getHandle(path)
+	ch, err := d.getHandle(path)
 	if err != nil {
 		return
 	}
-	// Guard: RemoveHash may have closed this handle between getHandle and WriteAt
-	if val, ok := d.handles.Load(path); ok {
-		if val.(*cachedHandle).closed.Load() {
-			logger.Printf("[DiskWarmup] Write skipped (tail): handle closed for %s", filepath.Base(path))
-			return
-		}
+	if ch.closed.Load() {
+		logger.Printf("[DiskWarmup] Write skipped (tail): handle closed for %s", filepath.Base(path))
+		return
 	}
 
-	n, _ := f.WriteAt(data, relOffset)
+	n, _ := ch.f.WriteAt(data, relOffset)
 	d.sizeCache.Store(path, sizeEntry{size: relOffset + int64(n), updatedAt: time.Now()})
 
 	endOff := relOffset + int64(n)
@@ -448,12 +442,12 @@ func (d *DiskWarmupCache) ReadTail(hash string, fileID int, buf []byte, absolute
 		d.tailCoverage.Store(path, &tailRange{highWatermark: fi.Size()})
 	}
 
-	f, err := d.getHandle(path)
+	ch, err := d.getHandle(path)
 	if err != nil {
 		return 0, nil
 	}
 
-	n, err := f.ReadAt(buf, relOffset)
+	n, err := ch.f.ReadAt(buf, relOffset)
 	return n, err
 }
 
