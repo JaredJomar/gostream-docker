@@ -178,7 +178,7 @@ func (d *DiskWarmupCache) writeWorker() {
 }
 
 func (d *DiskWarmupCache) WriteChunk(hash string, fileID int, data []byte, off int64) {
-	if off >= warmupFileSize || d.writeCh == nil {
+	if off > warmupFileSize || d.writeCh == nil {
 		return
 	}
 
@@ -200,20 +200,22 @@ func (d *DiskWarmupCache) WriteChunk(hash string, fileID int, data []byte, off i
 }
 
 func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off int64) {
-	if off >= warmupFileSize {
+	if off > warmupFileSize {
 		return
 	}
-	if off+int64(len(data)) > warmupFileSize {
+	// Only truncate chunks that straddle the boundary from below.
+	// Chunks starting AT warmupFileSize are written in full (the boundary chunk).
+	if off < warmupFileSize && off+int64(len(data)) > warmupFileSize {
 		data = data[:warmupFileSize-off]
 	}
 
 	path := d.filePath(hash, fileID)
 
 	if val, ok := d.sizeCache.Load(path); ok {
-		if entry := val.(sizeEntry); entry.size >= warmupFileSize {
+		if entry := val.(sizeEntry); entry.size > warmupFileSize {
 			return
 		}
-	} else if fi, err := os.Stat(path); err == nil && fi.Size() >= warmupFileSize {
+	} else if fi, err := os.Stat(path); err == nil && fi.Size() > warmupFileSize {
 		d.sizeCache.Store(path, sizeEntry{size: fi.Size(), updatedAt: time.Now()})
 		return
 	}
@@ -312,7 +314,7 @@ func (d *DiskWarmupCache) GetAvailableRange(hash string, fileID int) int64 {
 }
 
 func (d *DiskWarmupCache) ReadAt(hash string, fileID int, buf []byte, off int64) (int, error) {
-	if off >= warmupFileSize {
+	if off > warmupFileSize {
 		return 0, nil
 	}
 	path := d.filePath(hash, fileID)
@@ -327,10 +329,6 @@ func (d *DiskWarmupCache) ReadAt(hash string, fileID int, buf []byte, off int64)
 		return 0, nil
 	}
 
-	maxRead := warmupFileSize - off
-	if int64(len(buf)) > maxRead {
-		buf = buf[:maxRead]
-	}
 	if avail := availSize - off; int64(len(buf)) > avail {
 		buf = buf[:avail]
 	}

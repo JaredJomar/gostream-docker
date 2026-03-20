@@ -924,8 +924,11 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	if isNative {
 		h.hash = finalHash
 		h.fileID = fileIdx
-		// Pump starts on first real Read() — see Read() after isTailProbe detection.
-		// Late rescue path in Read() handles hash=='' case.
+		// Gillian: proactive pump start at Open() — pump ready before first Read().
+		// pumpOnce ensures single start; late rescue path in Read() handles hash=='' case.
+		h.pumpOnce.Do(func() {
+			h.startNativePump(finalHash, fileIdx)
+		})
 	}
 
 	// V182: Register for cleanup
@@ -1004,10 +1007,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		if curPos := atomic.LoadInt64(&ps.playerOff); curPos > 0 {
 			atomic.StoreInt64(&h.lastOff, curPos)
 		}
-		// [V264] Attach logged only at Refs > 1 to reduce Samba open/close cycle noise.
-		if refs := atomic.LoadInt32(&ps.refCount); refs > 1 {
-			logger.Printf("[V264] Attached to existing pump (Refs: %d): %s", refs, filepath.Base(h.path))
-		}
+		logger.Printf("[V264] Attached to existing pump (Refs: %d): %s", atomic.LoadInt32(&ps.refCount), filepath.Base(h.path))
 		pumpCreationMu.Unlock()
 		return
 	}
@@ -1365,7 +1365,7 @@ func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOf
 	// Check if this chunk is already cached in RAM
 	if data := raCache.Get(h.path, offset, offset); data != nil {
 		// V260: Even if in RAM, we might need to write it to Disk Warmup if not there yet
-		if diskWarmup != nil && h.hash != "" && offset < warmupFileSize {
+		if diskWarmup != nil && h.hash != "" && offset <= warmupFileSize {
 			diskWarmup.WriteChunk(h.hash, h.fileID, data, offset)
 		}
 		return false, offset + chunkSize
@@ -1375,7 +1375,7 @@ func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOf
 	// Pump jumps to warmupFileSize instantly; player reads warmup from SSD.
 	// No raCache seeding here — SSD serves these offsets directly in FUSE Read().
 	// Seeding would waste raCache budget and cause eviction of the boundary chunk.
-	if diskWarmup != nil && h.hash != "" && offset < warmupFileSize {
+	if diskWarmup != nil && h.hash != "" && offset <= warmupFileSize {
 		warmupCoverage := diskWarmup.GetAvailableRange(h.hash, h.fileID)
 		if warmupCoverage >= offset+chunkSize {
 			return false, offset + chunkSize
@@ -1396,7 +1396,7 @@ func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOf
 		raCache.Put(h.path, offset, offset+int64(n)-1, (*bufPtr)[:n])
 		// V256: Write to disk warmup cache (first 128MB only)
 		// V260: Sequential write via Async Worker
-		if diskWarmup != nil && h.hash != "" && offset < warmupFileSize {
+		if diskWarmup != nil && h.hash != "" && offset <= warmupFileSize {
 			diskWarmup.WriteChunk(h.hash, h.fileID, (*bufPtr)[:n], offset)
 		}
 	}
@@ -1494,29 +1494,21 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 		}
 	}
 
-	// Start pump on first real (non-tail-probe) Read — avoids spurious pump goroutines from probe-only handles.
-	if !isTailProbe && h.hash != "" {
-		h.pumpOnce.Do(func() {
-			h.startNativePump(h.hash, h.fileID)
-		})
-	}
-
 	// V286: Seek-Aware Interrupt. If player jumped far, wake up the pump immediately.
 	// V560: Skip for pre-confirmation tail reads — served by SSD, pump must not be interrupted.
 	budget := int64(globalConfig.ReadAheadBudget)
 	if h.nativeReader != nil && !isTailProbe && (off > prevOff+budget || (prevOff > off+budget && prevOff > 0)) {
 		h.nativeReader.Interrupt()
 		torrstor.ResetShield()
-		// Log only real seeks (prevOff >= 0), not first-read-on-new-handle noise (prevOff = -1).
-		if prevOff >= 0 {
-			logger.Printf("[V286] Interrupt pump for seek+shield reset: %dMB → %dMB",
-				prevOff/(1024*1024), off/(1024*1024))
-		}
+		logger.Printf("[V286] Interrupt pump for seek+shield reset: %dMB → %dMB",
+			prevOff/(1024*1024), off/(1024*1024))
 	}
 
 	// V256: Disk warmup cache — serves first 128MB from SSD while torrent activates.
 	// V261: Read directly into dest — no pool buffer, no 2MB over-read.
-	if diskWarmup != nil && h.hash != "" && off < warmupFileSize {
+	// V304b: Extended to off<=warmupFileSize so the boundary chunk (written by pump in
+	// session 1) is served from SSD in session 2, eliminating the FetchBlock stall.
+	if diskWarmup != nil && h.hash != "" && off <= warmupFileSize {
 		n, _ := diskWarmup.ReadAt(h.hash, h.fileID, dest, off)
 		if n > 0 {
 			timing.UsedCache = true
@@ -1827,7 +1819,7 @@ DATA_READY:
 
 		// V265: Seed warmup from Read path (both head and tail)
 		if diskWarmup != nil && h.hash != "" {
-			if off < warmupFileSize {
+			if off <= warmupFileSize {
 				diskWarmup.WriteChunk(h.hash, h.fileID, buf[:n], off)
 			} else if h.size > tailWarmupSize && off >= h.size-tailWarmupSize {
 				// V610: Frozen Tail — only update SSD tail cache before playback is confirmed.
@@ -1954,7 +1946,7 @@ DATA_READY:
 }
 
 func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
-	// Release logged by V260 below.
+	logger.Printf("=== RELEASE VIRTUAL === path=%s", h.path)
 
 	// V260: Shared Pump Reference Counting
 	if val, ok := activePumps.Load(h.path); ok {
@@ -1973,9 +1965,7 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 			return 0
 		}
 		newRefs := atomic.AddInt32(&ps.refCount, -1)
-		if newRefs > 0 {
-			logger.Printf("[V260] Release handle for %s (Remaining Refs: %d)", filepath.Base(h.path), newRefs)
-		}
+		logger.Printf("[V260] Release handle for %s (Remaining Refs: %d)", filepath.Base(h.path), newRefs)
 
 		if newRefs <= 0 {
 			// V420: Grace Period — allows Plex to close/reopen handles during CIFS
@@ -2000,8 +1990,7 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 					}
 				}
 			})
-			// V420 "entering grace" suppressed — fires on every Samba open/read/close cycle (noise).
-			// V420 "Shared Pump Terminated" below is the actionable event.
+			logger.Printf("[V420] Last handle closed: Shared Pump entering %s grace period for %s", graceDuration, filepath.Base(h.path))
 		}
 	}
 
