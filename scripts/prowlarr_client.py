@@ -46,33 +46,37 @@ class ProwlarrClient:
             logging.error(f"Error fetching from Prowlarr: {e}")
         return []
 
-    def fetch_from_prowlarr(self, imdb_id: str, content_type: str = "movie") -> List[Dict[str, Any]]:
+    def fetch_from_prowlarr(self, imdb_id: str, content_type: str = "movie", title: str = "") -> List[Dict[str, Any]]:
         """
-        Query Prowlarr for a specific IMDB ID.
-        TV: two queries (5040=HD + 5045=UHD) merged by infoHash to cover all indexers.
-        Movies: two queries (2040=HD + 2045=UHD).
+        Query Prowlarr with two strategies merged by infoHash:
+        - TV:    Q1: imdb_id + 5040 (HD, indexers that support subcategories)
+                 Q2: title   + 5000 (all TV, catches 4K from indexers using only parent category)
+        - Movie: Q1: imdb_id + 2040 (HD)
+                 Q2: imdb_id + 2045 (UHD)
         """
         if not self.ENABLED:
             return []
 
         prowlarr_type = "tvsearch" if content_type == "series" else "movie"
-        # Prowlarr does not support comma-separated categories — two separate queries needed
-        cat_hd, cat_uhd = ("5040", "5045") if content_type == "series" else ("2040", "2045")
 
         base_params = {
             "apikey": self.API_KEY,
-            "query": imdb_id,
             "type": prowlarr_type,
             "indexerIds": "-2"
         }
 
-        results_hd  = self._query({**base_params, "categories": cat_hd})
-        results_uhd = self._query({**base_params, "categories": cat_uhd})
+        if content_type == "series":
+            results_q1 = self._query({**base_params, "query": imdb_id, "categories": "5040"})
+            # Q2: title + 5000 catches 4K from indexers that don't tag imdbId or use parent category only
+            results_q2 = self._query({**base_params, "query": title, "categories": "5000"}) if title else []
+        else:
+            results_q1 = self._query({**base_params, "query": imdb_id, "categories": "2040"})
+            results_q2 = self._query({**base_params, "query": imdb_id, "categories": "2045"})
 
         # Merge deduplicating by infoHash
         seen = set()
         merged = []
-        for r in results_hd + results_uhd:
+        for r in results_q1 + results_q2:
             h = (r.get("infoHash") or "").lower()
             key = h if h else id(r)
             if key not in seen:
@@ -80,14 +84,15 @@ class ProwlarrClient:
                 merged.append(r)
         return merged
 
-    def fetch_torrents(self, imdb_id: str, content_type: str = "movie") -> List[Dict[str, Any]]:
+    def fetch_torrents(self, imdb_id: str, content_type: str = "movie", title: str = "") -> List[Dict[str, Any]]:
         """
         Fetch torrents from Prowlarr and return them in Stremio/Torrentio format.
+        title: show/movie name, used for UHD title-based search (TV only).
         """
         if not self.ENABLED:
             return []
-            
-        prowlarr_results = self.fetch_from_prowlarr(imdb_id, content_type)
+
+        prowlarr_results = self.fetch_from_prowlarr(imdb_id, content_type, title=title)
         return self._map_to_stremio_format(prowlarr_results)
 
     def _map_to_stremio_format(self, prowlarr_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

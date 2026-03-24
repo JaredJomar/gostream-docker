@@ -816,7 +816,7 @@ class GoStormTV:
 
     # ===== TORRENTIO =====
 
-    def get_streams(self, imdb_id: str, tmdb_id: int = 0) -> List[Dict]:
+    def get_streams(self, imdb_id: str, tmdb_id: int = 0, show_name: str = "") -> List[Dict]:
         """
         Get and classify streams from Prowlarr (primary) or Torrentio (fallback).
         Returns classified streams sorted by priority.
@@ -846,7 +846,7 @@ class GoStormTV:
 
         # 1. Try Prowlarr Adapter First (Primary)
         try:
-            prowlarr_streams = self.prowlarr.fetch_torrents(imdb_id, "series")
+            prowlarr_streams = self.prowlarr.fetch_torrents(imdb_id, "series", title=show_name)
             if prowlarr_streams:
                 self.log("INFO", f"✅ Prowlarr: found {len(prowlarr_streams)} streams for {imdb_id}")
                 for s in prowlarr_streams:
@@ -1300,7 +1300,7 @@ class GoStormTV:
             self.log("INFO", f"Skipping seasons {sorted(skipped_seasons)} (complete, quality >= {self.MIN_QUALITY_SKIP})")
 
         # Get and sort streams (pass tmdb_id to get correct number of seasons)
-        streams = self.get_streams(imdb_id, tmdb_id)
+        streams = self.get_streams(imdb_id, tmdb_id, show_name=show_name)
         if not streams:
             self.log("DEBUG", f"No streams for: {show_name}")
             return 0
