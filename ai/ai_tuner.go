@@ -21,6 +21,13 @@ import (
 
 var aiDisabled atomic.Bool
 
+// Circuit breaker
+var consecutiveTimeouts int32
+var cooldownUntil time.Time
+
+const maxConsecutiveTimeouts = 3
+const cooldownDuration = 5 * time.Minute
+
 var lastConns = 0
 var lastTimeout = 0
 var defaultConns = 0
@@ -40,13 +47,16 @@ const crisisCycle = 12 // 60s
 
 // Keep-Alive client for llama.cpp local
 var aiClient = &http.Client{
-	Timeout: 180 * time.Second,
+	Timeout: 45 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:      10,
 		IdleConnTimeout:   90 * time.Second,
 		DisableKeepAlives: false,
 	},
 }
+
+// Short-timeout client for KV cache reset (fire-and-forget)
+var cacheResetClient = &http.Client{Timeout: 10 * time.Second}
 
 type AITweak struct {
 	ConnectionsLimit float64 `json:"connections_limit"`
@@ -56,7 +66,7 @@ type AITweak struct {
 func resetLlamaCache(aiURL string) {
 	base := strings.TrimSuffix(aiURL, "/completion")
 	url := base + "/slots/0?action=erase"
-	resp, err := http.Post(url, "application/json", nil)
+	resp, err := cacheResetClient.Post(url, "application/json", nil)
 	if err != nil {
 		log.Printf("[AI-Pilot] KV cache reset skipped: %v", err)
 		return
@@ -141,6 +151,10 @@ var lastAnnounceAt time.Time
 
 func runTuningCycle(aiURL string) {
 	if aiDisabled.Load() {
+		return
+	}
+	// Circuit breaker: skip during cooldown
+	if !cooldownUntil.IsZero() && time.Now().Before(cooldownUntil) {
 		return
 	}
 	activeTorrents := torr.ListActiveTorrent()
@@ -329,9 +343,22 @@ func runTuningCycle(aiURL string) {
 			}
 			return
 		}
-		log.Printf("[AI-Pilot] Communication Delay: %v", err)
+		failures := atomic.AddInt32(&consecutiveTimeouts, 1)
+		log.Printf("[AI-Pilot] Communication Delay (%d/%d): %v", failures, maxConsecutiveTimeouts, err)
 		go resetLlamaCache(aiURL)
+		if failures >= maxConsecutiveTimeouts {
+			cooldownUntil = time.Now().Add(cooldownDuration)
+			atomic.StoreInt32(&consecutiveTimeouts, 0)
+			log.Printf("[AI-Pilot] Circuit breaker OPEN: %d consecutive timeouts — cooldown until %s",
+				maxConsecutiveTimeouts, cooldownUntil.Format("15:04:05"))
+		}
 		return
+	}
+
+	// Success: reset circuit breaker
+	if atomic.SwapInt32(&consecutiveTimeouts, 0) > 0 || !cooldownUntil.IsZero() {
+		log.Printf("[AI-Pilot] Circuit breaker CLOSED: AI recovered successfully")
+		cooldownUntil = time.Time{}
 	}
 
 	tweak.Sanitize()
