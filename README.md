@@ -30,6 +30,8 @@ This is not a torrent client with a media server bolted on. The FUSE filesystem 
 - Everything ships as a **single binary**: GoStorm engine, GoStream, metrics, control panel, and webhook receiver in one `gostream` executable.
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/MrRobotoGit/gostream)
+[![Docker Pulls](https://img.shields.io/docker/pulls/mrrobotogit/gostream?logo=docker&label=Docker+Pulls)](https://hub.docker.com/r/mrrobotogit/gostream)
+[![Docker Image Size](https://img.shields.io/docker/image-size/mrrobotogit/gostream/latest?logo=docker&label=Image+Size)](https://hub.docker.com/r/mrrobotogit/gostream)
 
 ---
 ## Control Panel
@@ -863,16 +865,26 @@ sudo tar -C /usr/local -xzf go1.24.0.linux-arm64.tar.gz
 > [!IMPORTANT]
 > GoStream mounts a FUSE filesystem at startup. Docker blocks this syscall by default — the container requires elevated privileges to run.
 
-**Build** (from the repository root):
+Pre-built images for `linux/amd64` and `linux/arm64` are published automatically on every release to Docker Hub and GitHub Container Registry:
+
+| Registry | Image |
+|----------|-------|
+| **Docker Hub** | `mrrobotogit/gostream:latest` |
+| **GHCR** | `ghcr.io/mrrobotogit/gostream:latest` |
+
+**Pull:**
 
 ```bash
-docker build -f docker/Dockerfile -t gostream .
+docker pull mrrobotogit/gostream:latest
+# or
+docker pull ghcr.io/mrrobotogit/gostream:latest
 ```
 
 **Run:**
 
 ```bash
 docker run -d \
+  --name gostream \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   --cap-add NET_ADMIN \
@@ -882,12 +894,18 @@ docker run -d \
   -p 8090:8090 \
   -p 8095:8095 \
   -p 8096:8096 \
-  gostream
+  mrrobotogit/gostream:latest
 ```
 
 Or use `--privileged` as a simpler alternative to the individual capabilities (e.g. on a Raspberry Pi where the container is fully trusted).
 
 `config.json` must be volume-mounted at `/config.json` (the default `MKV_PROXY_CONFIG_PATH`). Use `config.json.example` as the starting point.
+
+**Build from source** (from the repository root):
+
+```bash
+docker build -f docker/Dockerfile -t gostream .
+```
 
 ---
 
