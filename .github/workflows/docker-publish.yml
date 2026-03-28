@@ -7,7 +7,6 @@ name: Docker Publish
 
 on:
   push:
-    branches: [ main ]
     tags: [ 'v*.*.*' ]
   workflow_dispatch:
 
@@ -90,7 +89,7 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
           repository: mrrobotogit/gostream
           readme-filepath: ./README.md
-          short-description: "GoStream: Advanced BitTorrent/FUSE for streaming to your private Plex/Jellyfin library. No Debrid."
+          short-description: "Advanced BitTorrent-FUSE for real streaming to your private Plex/Jellyfin library. No Debrid."
 
       - name: Generate build summary
         run: |
