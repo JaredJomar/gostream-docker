@@ -1297,6 +1297,24 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 			pumpedBytes = 0 // reset grace period so throttle doesn't fire immediately
 		}
 
+		// V284b: Backward Snap — symmetric counterpart to V284 forward jump.
+		// Triggered when the player seeks backward past the pump by more than 2×budget.
+		// Scenario: player reads Cues at 1.5GB (V284 jumps pump there), then seeks to
+		// resume offset 380MB. V284 won't fire (player is behind pump). Without V284b the
+		// pump stays at 1.5GB throttled, forcing FetchBlock to serve 380MB alone (up to
+		// 24s). Using 2×jumpThreshold avoids interfering with normal 256MB read-ahead.
+		if playerOff > 0 && offset > playerOff+jumpThreshold*2 {
+			jumpTo := (playerOff / chunkSize) * chunkSize
+			if jumpTo < 0 {
+				jumpTo = 0
+			}
+			logger.Printf("[V284b] Pump backward snap: %dMB → %dMB (player at %dMB, overshoot %dMB)",
+				offset/(1024*1024), jumpTo/(1024*1024), playerOff/(1024*1024),
+				(offset-playerOff)/(1024*1024))
+			offset = jumpTo
+			pumpedBytes = 0
+		}
+
 		// V238: Adaptive Throttle Logic with Grace Period (64MB)
 		if pumpedBytes > 64*1024*1024 {
 			isHealthy := false
@@ -1424,12 +1442,17 @@ func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOf
 //
 // False cases (no interrupt):
 //   - prevOff <= 0: new or freshly-opened handle — no baseline to compare against
-//   - off == 0: Samba/CIFS always issues a header probe at offset 0 on every file
-//     open; this is NOT a user seek and must never restart the pump
+//   - off <= warmupFileSize: any read inside the warmup zone (0–64MB inclusive)
+//     is served directly from the SSD cache and must never restart the pump.
+//     This covers Samba header probes at off=0 AND container header reads
+//     (EBML at 32KB, MP4 atoms at 512KB, etc.) that Infuse/Plex scanners issue
+//     on every open. Without this guard a scan handle with prevOff=7GB reading
+//     at off=32KB fires V286 spuriously, resetting the pump to 0 (confirmed:
+//     59 hits/day in production logs).
 //   - |off - prevOff| <= budget: normal sequential read or small seek within
 //     the read-ahead window
 func shouldInterruptForSeek(prevOff, off, budget int64) bool {
-	if prevOff <= 0 || off == 0 {
+	if prevOff <= 0 || off <= warmupFileSize {
 		return false
 	}
 	return off > prevOff+budget || prevOff > off+budget
