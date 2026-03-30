@@ -1507,7 +1507,8 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 
 							hHash := metainfo.NewHashFromHex(h.hash)
 							if t := web.BTS.GetTorrent(hHash); t != nil {
-								logger.Printf("[V238] FULL Aggressive Mode enabled on-the-fly for: %s", h.hash[:8])
+								t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
+								logger.Printf("[Pump] Aggressive mode enabled on-the-fly for: %s", h.hash[:8])
 							}
 
 							upgradedState := sharedState

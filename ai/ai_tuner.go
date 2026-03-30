@@ -26,7 +26,13 @@ var consecutiveTimeouts int32
 var cooldownUntil time.Time
 
 const maxConsecutiveTimeouts = 3
-const cooldownDuration = 5 * time.Minute
+const cooldownDuration = 2 * time.Minute
+
+// Reset lock: prevents concurrent reset + completion requests to llama-server
+var resetInProgress atomic.Bool
+
+// skipAICycles: after a context reset, skip N AI cycles before calling llama-server
+var skipAICycles int
 
 var lastConns = 0
 var lastTimeout = 0
@@ -47,7 +53,7 @@ const crisisCycle = 12 // 60s
 
 // Keep-Alive client for llama.cpp local
 var aiClient = &http.Client{
-	Timeout: 45 * time.Second,
+	Timeout: 60 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:      10,
 		IdleConnTimeout:   90 * time.Second,
@@ -64,6 +70,13 @@ type AITweak struct {
 }
 
 func resetLlamaCache(aiURL string) {
+	// Deduplicate: if a reset (or completion) is already in flight, skip.
+	if !resetInProgress.CompareAndSwap(false, true) {
+		log.Printf("[AI-Pilot] KV cache reset skipped: server busy")
+		return
+	}
+	defer resetInProgress.Store(false)
+
 	base := strings.TrimSuffix(aiURL, "/completion")
 	url := base + "/slots/0?action=erase"
 	resp, err := cacheResetClient.Post(url, "application/json", nil)
@@ -230,7 +243,7 @@ func runTuningCycle(aiURL string) {
 
 	currentHash := activeT.Hash().String()
 	if lastActiveHash != "" && currentHash != lastActiveHash {
-		log.Printf("[AI-Pilot] Context Change Detected: Resetting history for new torrent.")
+		log.Printf("[AI-Pilot] Context Change Detected: Applying defaults (Conns:%d Timeout:%ds) for new torrent.", defaultConns, defaultTimeout)
 		metricsHistory = nil
 		torrentSpeedAvg = nil
 		cpuUsageAvg = nil
@@ -240,6 +253,12 @@ func runTuningCycle(aiURL string) {
 		pulseCounter = 0
 		peakCPUCycle = 0
 		lastAnnounceAt = time.Time{}
+		skipAICycles = 2 // skip 2 AI cycles (~6-10 min) to let reset complete
+		if activeT.Torrent != nil {
+			activeT.Torrent.SetMaxEstablishedConns(defaultConns)
+			activeT.AddExpiredTime(time.Duration(defaultTimeout) * time.Second)
+		}
+		atomic.StoreInt32(&CurrentLimit, int32(defaultConns))
 		go resetLlamaCache(aiURL)
 	}
 	lastActiveHash = currentHash
@@ -273,6 +292,19 @@ func runTuningCycle(aiURL string) {
 	}
 	cycleCounter = 0
 
+	// Post-reset guard: skip AI call if we're still in the cooldown after context change
+	if skipAICycles > 0 {
+		skipAICycles--
+		log.Printf("[AI-Pilot] Post-reset guard: skipping AI call (%d cycles remaining)", skipAICycles)
+		return
+	}
+
+	// Server busy guard: skip if a reset is in flight
+	if resetInProgress.Load() {
+		log.Printf("[AI-Pilot] Server busy (reset in progress): skipping AI call.")
+		return
+	}
+
 	// --- SMART CONTEXT GENERATION (Every 3m) ---
 	avgTorrentSpeed := getAverage(torrentSpeedAvg)
 	avgCPU := getAverage(cpuUsageAvg)
@@ -295,9 +327,20 @@ func runTuningCycle(aiURL string) {
 		}
 	}
 
-	// IDLE GUARD: buffer full + no download → nothing to optimize
+	// IDLE GUARD: buffer full + no download → restore defaults for next episode
 	if buffer > 95 && currSpeedMBs == 0 {
-		log.Printf("[AI-Pilot] Idle guard: buffer=%d%% speed=0 — skipping AI call.", buffer)
+		if lastConns != defaultConns || lastTimeout != defaultTimeout {
+			log.Printf("[AI-Pilot] Idle guard: buffer=%d%% speed=0 — restoring defaults (Conns:%d Timeout:%ds).", buffer, defaultConns, defaultTimeout)
+			if activeT.Torrent != nil {
+				activeT.Torrent.SetMaxEstablishedConns(defaultConns)
+				activeT.AddExpiredTime(time.Duration(defaultTimeout) * time.Second)
+			}
+			atomic.StoreInt32(&CurrentLimit, int32(defaultConns))
+			lastConns = defaultConns
+			lastTimeout = defaultTimeout
+		} else {
+			log.Printf("[AI-Pilot] Idle guard: buffer=%d%% speed=0 — skipping AI call.", buffer)
+		}
 		return
 	}
 
@@ -404,6 +447,12 @@ func runTuningCycle(aiURL string) {
 }
 
 func fetchAIJSON[T any](url string, prompt string) (*T, error) {
+	// Serialize with resetLlamaCache: llama-server is single-slot
+	if !resetInProgress.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("server busy (reset in progress)")
+	}
+	defer resetInProgress.Store(false)
+
 	start := time.Now()
 
 	grammar := `root ::= "{\"connections_limit\":" number ",\"peer_timeout_seconds\":" number "}"
