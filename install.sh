@@ -901,9 +901,16 @@ compile_binary() {
     # GOTMPDIR on the main FS avoids OOM on small /tmp tmpfs during linking
     local go_tmp="${HOME}/go-tmp"
     mkdir -p "${go_tmp}"
+
+    # Embed version from git tag into the binary
+    local app_version
+    app_version=$(git describe --tags --abbrev=0 2>/dev/null || echo "dev")
+    local ldflags="-X main.AppVersion=${app_version}"
+    print_info "Embedding version: ${app_version}"
+
     print_info "Building binary (GOARCH=${GO_ARCH}, -p 2)..."
     GOTOOLCHAIN=local GOARCH="${GO_ARCH}" CGO_ENABLED=1 GOTMPDIR="${go_tmp}" \
-        "$GO_BIN" build ${pgo_flag} -p 2 -o "${out_bin}" .
+        "$GO_BIN" build ${pgo_flag} -p 2 -ldflags "${ldflags}" -o "${out_bin}" .
     rm -rf "${go_tmp}"
 
     chmod +x "${out_bin}"
