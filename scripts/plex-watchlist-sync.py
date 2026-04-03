@@ -306,17 +306,25 @@ def build_existing_index() -> Tuple[set, Dict[str, str]]:
                 _extract_title_year(mkv, title_index)
                 continue
                 
-            # V290: Read full file (up to 4KB) and split lines to handle long tracker lists.
-            # Normal readline() can fail or stall on FUSE if preceding lines are too long.
+        # V290: Read full file (up to 4KB) and detect format.
+        try:
             with open(mkv, "r", errors="ignore") as f:
-                content = f.read(4096)
-                lines = [l.strip() for l in content.splitlines()]
+                content = f.read(4096).strip()
         except Exception:
             continue
 
-        # Skip broken MKVs (size=0 on line 2 means metadata never resolved,
-        # Plex ignores 0-byte files — treat as absent so we can recreate)
-        size_val = lines[1] if len(lines) > 1 else "0"
+        # Detect JSON vs line-based format
+        if content.startswith('{'):
+            try:
+                data = json.loads(content)
+                size_val = str(data.get('size', 0))
+                imdb_val = data.get('imdb', '')
+            except (json.JSONDecodeError, KeyError):
+                continue
+        else:
+            lines = [l.strip() for l in content.splitlines()]
+            size_val = lines[1] if len(lines) > 1 else "0"
+            imdb_val = lines[3] if len(lines) >= 4 else ""
         if size_val == "0" or size_val == "":
             log.debug(f"  Broken MKV (size=0), will re-create: {mkv.name}")
             continue
@@ -560,11 +568,7 @@ def create_mkv(
     year: str,
 ) -> str:
     """
-    Write virtual .mkv (4 lines):
-      line 1: GoStorm stream URL
-      line 2: file size in bytes
-      line 3: magnet URL (for rehydration)
-      line 4: IMDB ID (for existing-index lookup)
+    Write virtual .mkv in JSON format.
     Returns path on success, '' on failure.
     """
     stream_url = f"{TORRSERVER}/stream?link={hash_val}&index={file_index}&play"
@@ -575,12 +579,14 @@ def create_mkv(
 
     try:
         os.makedirs(MOVIES_DIR, exist_ok=True)
+        data = {
+            'url': stream_url,
+            'size': file_size if file_size > 0 else 0,
+            'magnet': magnet,
+            'imdb': imdb_id or '',
+        }
         with open(path, "w") as f:
-            f.write(stream_url + "\n")
-            f.write((str(file_size) if file_size > 0 else "0") + "\n")
-            f.write(magnet + "\n")
-            if imdb_id:
-                f.write(imdb_id + "\n")
+            f.write(json.dumps(data, separators=(',', ':')))
         log.info(f"Created: {path}")
         return path
     except IOError as e:

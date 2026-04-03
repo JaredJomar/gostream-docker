@@ -580,50 +580,82 @@ class GoStormSync:
         hv = hash_value.lower()
         return self._hash_cache.get(hv, "")
 
+    # === .mkv format helpers ===
+
+    @staticmethod
+    def _is_json_mkv(content: str) -> bool:
+        return content.strip().startswith('{')
+
+    @staticmethod
+    def _read_mkv_fields(content: str):
+        """Read url, size, magnet, imdb from either JSON or line-based .mkv content.
+        Returns (url, size_str, magnet, imdb) — all strings."""
+        trimmed = content.strip()
+        if trimmed.startswith('{'):
+            try:
+                data = json.loads(trimmed)
+                return (
+                    data.get('url', ''),
+                    str(data.get('size', 0)),
+                    data.get('magnet', ''),
+                    data.get('imdb', ''),
+                )
+            except (json.JSONDecodeError, KeyError):
+                return ('', '', '', '')
+        # Legacy line-based
+        lines = [l.strip() for l in content.splitlines()]
+        url = lines[0] if len(lines) > 0 else ''
+        size = lines[1] if len(lines) > 1 else '0'
+        magnet = lines[2] if len(lines) > 2 else ''
+        imdb = lines[3] if len(lines) >= 4 else ''
+        return (url, size, magnet, imdb)
+
+    def _write_mkv_json(self, path: str, stream_url: str, file_size_bytes: str,
+                        magnet_url: str, imdb_id: str) -> bool:
+        """Write .mkv file in JSON format."""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            size = int(file_size_bytes) if (file_size_bytes and file_size_bytes.isdigit()) else 0
+            data = {
+                'url': stream_url,
+                'size': size,
+                'magnet': magnet_url or '',
+                'imdb': imdb_id or '',
+            }
+            with open(path, 'w') as f:
+                f.write(json.dumps(data, separators=(',', ':')))
+            size_gb = round(size / self.BYTES_PER_GB, 1) if size > 0 else 0
+            self.log("DEBUG", f"Created .mkv (JSON) size: {size_gb}GB for {os.path.basename(path)}")
+            return True
+        except Exception as e:
+            self.log("ERROR", f"Failed to create .mkv: {e}")
+            return False
+
+    @staticmethod
+    def _read_mkv_url(path: str) -> str:
+        """Read stream URL from .mkv file (JSON or line-based)."""
+        try:
+            with open(path, 'r') as f:
+                content = f.read()
+            url, _, _, _ = GoStormSync._read_mkv_fields(content)
+            return url
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _extract_hash_from_mkv(path: str) -> str:
+        """Extract 40-char torrent hash from .mkv file URL."""
+        url = GoStormSync._read_mkv_url(path)
+        m = re.search(r'link=([a-f0-9]{40})', url, re.IGNORECASE)
+        return m.group(1).lower() if m else ''
+
     def create_mkv_with_metadata(self, mkv_file: str, stream_url: str, file_size_bytes: str = "", magnet_url: str = "", imdb_id: str = "") -> bool:
         """
         Create virtual .mkv file with embedded size metadata + magnet for rehydration
         Enhanced version with magnet persistence for automatic torrent recovery
+        Writes JSON format.
         """
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(mkv_file), exist_ok=True)
-            
-            with open(mkv_file, 'w') as f:
-                f.write(stream_url + '\n')
-                if file_size_bytes and file_size_bytes.isdigit() and int(file_size_bytes) > 0:
-                    f.write(file_size_bytes + '\n')
-                    size_gb = round(int(file_size_bytes) / self.BYTES_PER_GB, 1)
-                    self.log("DEBUG", f"Created .mkv with actual size: {size_gb}GB for {os.path.basename(mkv_file)}")
-                else:
-                    f.write('0\n')
-                    self.log("DEBUG", f"Created .mkv with default size for {os.path.basename(mkv_file)}")
-                # Third line: magnet for rehydration
-                if magnet_url:
-                    f.write(magnet_url + '\n')
-                else:
-                    f.write('\n')
-                
-                # Fourth line: IMDB ID for auto-rescue logic
-                if imdb_id:
-                    f.write(imdb_id + '\n')
-            
-            # Update hash cache if initialized
-            if hasattr(self, "_hash_cache"):
-                try:
-                    with open(mkv_file, 'r') as fh:
-                        first = fh.readline().strip()
-                    mh = re.search(r'link=([a-f0-9]{40})', first, re.IGNORECASE)
-                    if mh:
-                        self._hash_cache[mh.group(1).lower()] = mkv_file
-                except Exception:
-                    pass
-            
-            return True
-            
-        except IOError as e:
-            self.log("ERROR", f"Failed to create mkv file {mkv_file}: {e}")
-            return False
+        return self._write_mkv_json(mkv_file, stream_url, file_size_bytes, magnet_url, imdb_id)
 
     def should_replace_mkv(self, mkv_file: str, new_title: str, new_size: str = "", new_name: str = "") -> bool:
         """
@@ -638,9 +670,8 @@ class GoStormSync:
         try:
             # Read first (url) and second line (size) of existing file
             with open(mkv_file, 'r') as f:
-                lines = f.readlines()
-                old_url = lines[0].strip() if len(lines) > 0 else ""
-                old_size = lines[1].strip() if len(lines) > 1 else ""
+                content = f.read()
+            old_url, old_size, _, _ = self._read_mkv_fields(content)
         except (IOError, IndexError):
             return True  # If we can't read the file, replace it
         
@@ -780,8 +811,9 @@ class GoStormSync:
                 
                 episode_path = os.path.join(season_dir, episode_file)
                 try:
-                    with open(episode_path, 'r') as f:
-                        old_url = f.readline().strip()
+                    old_url = self._read_mkv_url(episode_path)
+                    if not old_url:
+                        continue
                     
                     # Calculate existing score using episode filename tokens
                     existing_score = self.calculate_quality_score(old_url + " " + episode_file)
@@ -1122,10 +1154,7 @@ class GoStormSync:
                 if old_hash:
                     # Non eliminare se coincide con hash nuovo
                     try:
-                        with open(new_mkv, 'r') as nf:
-                            first_new = nf.readline().strip()
-                        mnew = re.search(r'link=([a-f0-9]{40})', first_new, re.IGNORECASE)
-                        new_hash = mnew.group(1).lower() if mnew else ""
+                        new_hash = self._extract_hash_from_mkv(new_mkv)
                     except Exception:
                         new_hash = ""
                     if new_hash and new_hash == old_hash:
@@ -4040,11 +4069,9 @@ class GoStormSync:
                                     if file.lower().endswith('.mkv'):
                                         file_path = os.path.join(root, file)
                                         try:
-                                            with open(file_path, 'r') as f:
-                                                url_line = f.readline().strip()
-                                            hash_match = re.search(r'link=([a-f0-9]{40})', url_line, re.IGNORECASE)
-                                            if hash_match:
-                                                hashes_to_remove.append(hash_match.group(1).lower())
+                                            h = self._extract_hash_from_mkv(file_path)
+                                            if h:
+                                                hashes_to_remove.append(h)
                                         except (IOError, Exception):
                                             continue
                             
@@ -4197,8 +4224,9 @@ class GoStormSync:
                                 
                                 # Get torrent info from first video file to compare
                                 try:
-                                    with open(existing_video_files[0], 'r') as f:
-                                        existing_stream_url = f.readline().strip()
+                                    existing_stream_url = self._read_mkv_url(existing_video_files[0])
+                                    if not existing_stream_url:
+                                        continue
                                     
                                     # Extract hash from existing stream URL
                                     existing_hash_match = re.search(r'link=([a-f0-9]{40})', existing_stream_url, re.IGNORECASE)
@@ -4312,8 +4340,7 @@ class GoStormSync:
                             if os.path.isfile(episode_mkv):
                                 try:
                                     # minimal validity check: first line starts with torrent stream url pattern
-                                    with open(episode_mkv, 'r') as ef:
-                                        first_line = ef.readline().strip()
+                                    first_line = self._read_mkv_url(episode_mkv)
                                     if 'stream?link=' in first_line:
                                         self.log("DEBUG", f"Skip existing episode file (idempotent): {os.path.basename(episode_mkv)}")
                                         continue
@@ -4604,8 +4631,7 @@ class GoStormSync:
                     if file.lower().endswith(video_extensions):
                         video_file = os.path.join(root, file)
                         try:
-                            with open(video_file, 'r') as f:
-                                stream_url = f.readline().strip()
+                            stream_url = self._read_mkv_url(video_file)
                             
                             # Extract hash from stream URL
                             import re
@@ -4675,8 +4701,7 @@ class GoStormSync:
                     file_path = os.path.join(root, file)
                     try:
                         # Extract hash from file content
-                        with open(file_path, 'r') as f:
-                            stream_url = f.readline().strip()
+                        stream_url = self._read_mkv_url(file_path)
                         
                         # Extract torrent hash from URL
                         import re
@@ -4747,12 +4772,10 @@ class GoStormSync:
                     file_path = os.path.join(root, file)
                     try:
                         with open(file_path, 'r') as f:
-                            lines = f.readlines()
-                        # Line 4 (index 3) = IMDB ID
-                        if len(lines) >= 4:
-                            imdb_id = lines[3].strip()
-                            if imdb_id and imdb_id.startswith('tt'):
-                                imdb_to_files[imdb_id].append(file_path)
+                            content = f.read()
+                        _, _, _, imdb_id = self._read_mkv_fields(content)
+                        if imdb_id and imdb_id.startswith('tt'):
+                            imdb_to_files[imdb_id].append(file_path)
                     except Exception:
                         pass
 
@@ -4788,11 +4811,10 @@ class GoStormSync:
             for file_path, filename, score in files_with_scores[1:]:
                 self.log("INFO", f"  Remove ({score}): {filename[:60]}...")
                 try:
-                    # Extract torrent hash from stream URL (line 1)
+                    # Extract torrent hash from stream URL
                     torrent_hash = None
                     try:
-                        with open(file_path, 'r') as f:
-                            stream_url = f.readline().strip()
+                        stream_url = self._read_mkv_url(file_path)
                         hash_match = re.search(r'link=([a-f0-9]{40})', stream_url, re.IGNORECASE)
                         if hash_match:
                             torrent_hash = hash_match.group(1)
@@ -4889,19 +4911,16 @@ class GoStormSync:
                 try:
                     # Extract hash from file to remove corresponding torrent
                     torrent_hash = None
-                    stream_url = ""
-                    try:
-                        with open(file_path, 'r') as f:
-                            stream_url = f.readline().strip()
-                        self.log("DEBUG", f"  Stream URL: {stream_url[:80]}...")
-                        hash_match = re.search(r'link=([a-f0-9]{40})', stream_url, re.IGNORECASE)
-                        if hash_match:
-                            torrent_hash = hash_match.group(1)
-                            self.log("DEBUG", f"  Found hash: {torrent_hash[:8]}...")
-                        else:
-                            self.log("WARN", f"  No hash found in URL: {stream_url}")
-                    except Exception as e:
-                        self.log("ERROR", f"  Failed to read file {file_path}: {e}")
+                    stream_url = self._read_mkv_url(file_path)
+                    self.log("DEBUG", f"  Stream URL: {stream_url[:80]}...")
+                    hash_match = re.search(r'link=([a-f0-9]{40})', stream_url, re.IGNORECASE)
+                    if hash_match:
+                        torrent_hash = hash_match.group(1)
+                        self.log("DEBUG", f"  Found hash: {torrent_hash[:8]}...")
+                    else:
+                        self.log("WARN", f"  No hash found in URL: {stream_url}")
+                except Exception as e:
+                    self.log("ERROR", f"  Failed to read file {file_path}: {e}")
                     
                     # Remove the .mkv file
                     self.log("DEBUG", f"  Removing file: {file_path}")
@@ -5161,11 +5180,10 @@ class GoStormSync:
                     file_path = os.path.join(root, filename)
                     try:
                         with open(file_path, 'r') as fh:
-                            lines = fh.readlines()
-                        if len(lines) < 3:
+                            content = fh.read()
+                        stream_line, _, magnet_line, _ = self._read_mkv_fields(content)
+                        if not stream_line or not magnet_line:
                             continue
-                        stream_line = lines[0].strip()
-                        magnet_line = lines[2].strip()
                         
                         # Extract hash from stream URL
                         hash_match = re.search(r'link=([a-f0-9]{40})', stream_line, re.IGNORECASE)
@@ -5183,6 +5201,9 @@ class GoStormSync:
                             # Rebuild magnet with dynamic trackers (old files may not have them)
                             magnet_with_trackers = self._build_magnet(hash_val)
                             self.add_torrent_to_server(magnet_with_trackers, filename)
+                            # Convert to JSON format (lazy migration during rehydration)
+                            _, size_str, _, imdb_str = self._read_mkv_fields(content)
+                            self._write_mkv_json(file_path, stream_line, size_str or "0", magnet_with_trackers, imdb_str)
                             rehydrated += 1
                     except Exception:
                         continue
@@ -5217,13 +5238,12 @@ class GoStormSync:
                 try:
                     # Read current file content
                     with open(file_path, 'r') as f:
-                        lines = f.readlines()
-                    
-                    if not lines:
+                        content = f.read()
+
+                    stream_line, _, _, _ = self._read_mkv_fields(content)
+                    if not stream_line:
                         continue
-                        
-                    # Extract hash and current index from stream URL
-                    stream_line = lines[0].strip()
+
                     if 'stream?link=' not in stream_line:
                         continue
                         
@@ -5315,12 +5335,9 @@ class GoStormSync:
                     if 'index=' not in stream_line:
                         new_stream_line = stream_line.replace('&play', f'&index={correct_index}&play')
                     
-                    # Update first line while preserving the rest
-                    lines[0] = new_stream_line + '\n'
-                    
-                    # Write back to file
-                    with open(file_path, 'w') as f:
-                        f.writelines(lines)
+                    # Update the file preserving format
+                    _, size_str, magnet_str, imdb_str = self._read_mkv_fields(content)
+                    self._write_mkv_json(file_path, new_stream_line, size_str, magnet_str, imdb_str)
                     
                     fixed += 1
                     

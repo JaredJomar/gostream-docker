@@ -347,12 +347,15 @@ class GoStormTV:
                 # Read file to get full hash
                 try:
                     with open(filepath, 'r') as mf:
-                        lines = mf.readlines()
-                    if len(lines) >= 1:
-                        hash_match = re.search(r'link=([a-f0-9]{40})', lines[0], re.I)
-                        full_hash = hash_match.group(1) if hash_match else None
+                        content = mf.read()
+                    trimmed = content.strip()
+                    if trimmed.startswith('{'):
+                        data = json.loads(trimmed)
+                        url_line = data.get('url', '')
                     else:
-                        full_hash = None
+                        url_line = content.splitlines()[0] if content.splitlines() else ''
+                    hash_match = re.search(r'link=([a-f0-9]{40})', url_line, re.I)
+                    full_hash = hash_match.group(1) if hash_match else None
                 except:
                     full_hash = None
 
@@ -1015,13 +1018,17 @@ class GoStormTV:
         return f"{clean_show}_S{season:02d}E{episode:02d}_{hash8}.mkv"
 
     def _create_mkv(self, filepath: str, stream_url: str, file_size: int, magnet: str) -> bool:
-        """Create virtual .mkv file with metadata"""
+        """Create virtual .mkv file with metadata in JSON format"""
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            data = {
+                'url': stream_url,
+                'size': file_size,
+                'magnet': magnet,
+                'imdb': '',
+            }
             with open(filepath, 'w') as f:
-                f.write(stream_url + '\n')
-                f.write(str(file_size) + '\n')
-                f.write(magnet + '\n')
+                f.write(json.dumps(data, separators=(',', ':')))
             return True
         except IOError as e:
             self.log("ERROR", f"Failed to create {filepath}: {e}")
@@ -1488,13 +1495,20 @@ class GoStormTV:
                 filepath = os.path.join(root, filename)
                 try:
                     with open(filepath, 'r') as f:
-                        lines = f.readlines()
-
-                    if len(lines) < 3:
-                        continue
-
-                    stream_line = lines[0].strip()
-                    magnet_line = lines[2].strip()
+                        content = f.read()
+                    trimmed = content.strip()
+                    if trimmed.startswith('{'):
+                        data = json.loads(trimmed)
+                        stream_line = data.get('url', '')
+                        magnet_line = data.get('magnet', '')
+                        file_size = data.get('size', 0)
+                    else:
+                        lines = [l.strip() for l in content.splitlines()]
+                        if len(lines) < 3:
+                            continue
+                        stream_line = lines[0]
+                        magnet_line = lines[2]
+                        file_size = int(lines[1]) if (len(lines) > 1 and lines[1].isdigit()) else 0
 
                     # Extract hash from stream URL
                     hash_match = re.search(r'link=([a-f0-9]{40})', stream_line, re.IGNORECASE)
@@ -1515,6 +1529,8 @@ class GoStormTV:
                         if self._ts_add_torrent(fresh_magnet, filename):
                             rehydrated += 1
                             active_hashes.add(hash_val)  # Prevent duplicate adds
+                            # Convert to JSON format (lazy migration during rehydration)
+                            self._create_mkv(filepath, stream_line, file_size, fresh_magnet)
                             # CRITICAL: Sleep between adds to let GoStorm resolve DHT/Metadata
                             time.sleep(5) 
 
