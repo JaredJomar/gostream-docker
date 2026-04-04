@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -87,11 +88,17 @@ type SpeedPoint struct {
 	Speed float64 `json:"v"`
 }
 
+const (
+	fuseFileCountTTL = 4 * time.Hour
+	publicIPTTL      = 60 * time.Second
+)
+
 // Collector polls system services on a ticker.
 type Collector struct {
 	gostormURL string
 	metricsURL string
-	fusePath   string
+	fusePath   string   // FUSE mount point (for mount status check)
+	sourcePath string   // physical_source_path (for file counting)
 	vpnIface   string
 	plexURL    string
 	plexToken  string
@@ -106,14 +113,21 @@ type Collector struct {
 
 	prevCPUIdle  uint64
 	prevCPUTotal uint64
+
+	fuseFileCount     int
+	fuseFileCountTime time.Time
+
+	publicIP     string
+	publicIPTime time.Time
 }
 
 // New creates a Collector.
-func New(gostormURL, fusePath, vpnIface, plexURL, plexToken string, natpmpPort, metricsPort int) *Collector {
+func New(gostormURL, fusePath, sourcePath, vpnIface, plexURL, plexToken string, natpmpPort, metricsPort int) *Collector {
 	return &Collector{
 		gostormURL:   gostormURL,
 		metricsURL:   fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort),
 		fusePath:     fusePath,
+		sourcePath:   sourcePath,
 		vpnIface:     vpnIface,
 		plexURL:      plexURL,
 		plexToken:    plexToken,
@@ -394,19 +408,51 @@ func (c *Collector) checkFUSE() ServiceStatus {
 		return ServiceStatus{OK: false, Message: "not configured"}
 	}
 	start := time.Now()
-	entries, err := os.ReadDir(c.fusePath)
-	latency := int(time.Since(start).Milliseconds())
-	if err != nil {
-		return ServiceStatus{OK: false, Latency: latency, Message: err.Error()}
+	// Verify FUSE mount is accessible
+	if _, err := os.Stat(c.fusePath); err != nil {
+		return ServiceStatus{OK: false, Latency: int(time.Since(start).Milliseconds()), Message: err.Error()}
 	}
-	return ServiceStatus{OK: true, Latency: latency, Message: fmt.Sprintf("%d files", len(entries))}
+	// Count .mkv files from physical_source_path (same as Python health-monitor):
+	//   movies/   → flat glob  *.mkv
+	//   tv/       → recursive  **/*.mkv
+	// Cached every 4h to avoid hammering disk on every dashboard refresh.
+	if time.Since(c.fuseFileCountTime) > fuseFileCountTTL || c.fuseFileCountTime.IsZero() {
+		base := c.sourcePath
+		if base == "" {
+			base = c.fusePath
+		}
+		count := 0
+		// movies/ — flat (Python: Path(MOVIES_DIR).glob("*.mkv"))
+		moviesDir := filepath.Join(base, "movies")
+		if entries, err := os.ReadDir(moviesDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".mkv") {
+					count++
+				}
+			}
+		}
+		// tv/ — recursive (Python: Path(TV_DIR).rglob("*.mkv"))
+		tvDir := filepath.Join(base, "tv")
+		if _, err := os.Stat(tvDir); err == nil {
+			filepath.WalkDir(tvDir, func(_ string, d os.DirEntry, err error) error {
+				if err == nil && !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".mkv") {
+					count++
+				}
+				return nil
+			})
+		}
+		c.fuseFileCount = count
+		c.fuseFileCountTime = time.Now()
+	}
+	latency := int(time.Since(start).Milliseconds())
+	return ServiceStatus{OK: true, Latency: latency, Message: fmt.Sprintf("%d files", c.fuseFileCount)}
 }
 
 func (c *Collector) checkVPN() ServiceStatus {
 	if c.vpnIface == "" {
 		return ServiceStatus{OK: false, Message: "not configured"}
 	}
-	// Read interface flags from /sys/class/net/<iface>/flags (Linux)
+	// Check interface is up
 	flagsData, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/flags", c.vpnIface))
 	if err != nil {
 		return ServiceStatus{OK: false, Message: c.vpnIface + " not found"}
@@ -416,18 +462,26 @@ func (c *Collector) checkVPN() ServiceStatus {
 	if flags&iffUp == 0 {
 		return ServiceStatus{OK: false, Message: c.vpnIface + " down"}
 	}
-	// Get IP address
-	addrData, err := os.ReadFile(fmt.Sprintf("/proc/net/if_inet6"))
-	_ = addrData // ipv4 from /sys not straightforward; use net.InterfaceByName
+	// Public IP via api.ipify.org — cached 60s (same as Python health-monitor)
+	if time.Since(c.publicIPTime) > publicIPTTL || c.publicIPTime.IsZero() {
+		cl := &http.Client{Timeout: 2 * time.Second}
+		if resp, err := cl.Get("https://api.ipify.org"); err == nil {
+			if body, err := io.ReadAll(resp.Body); err == nil && len(body) > 0 {
+				c.publicIP = strings.TrimSpace(string(body))
+			}
+			resp.Body.Close()
+		}
+		c.publicIPTime = time.Now()
+	}
+	if c.publicIP != "" {
+		return ServiceStatus{OK: true, Message: c.publicIP}
+	}
+	// Fallback: internal interface IP
 	iface, err := net.InterfaceByName(c.vpnIface)
 	if err != nil {
 		return ServiceStatus{OK: true, Message: c.vpnIface + " up"}
 	}
-	addrs, err := iface.Addrs()
-	if err != nil || len(addrs) == 0 {
-		return ServiceStatus{OK: true, Message: c.vpnIface + " up"}
-	}
-	// Find IPv4
+	addrs, _ := iface.Addrs()
 	for _, a := range addrs {
 		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
 			return ServiceStatus{OK: true, Message: ipnet.IP.String()}

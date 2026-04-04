@@ -3142,8 +3142,9 @@ func main() {
 	// Health Monitor + Dashboard (Fase 5)
 	monCollector := collector.New(
 		"http://127.0.0.1:8090",
-		"/mnt/torrserver-go",
-		"wg0",
+		globalConfig.FuseMountPath,
+		physicalSourcePath,
+		globalConfig.NatPMP.VPNInterface,
 		globalConfig.Plex.URL,
 		globalConfig.Plex.Token,
 		globalConfig.NatPMP.LocalPort,
