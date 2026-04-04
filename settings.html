@@ -525,6 +525,7 @@
     <div class="container">
         <header>
             <h1>GoStream <span>Control</span></h1>
+            <a class="live-badge" id="update-badge" href="https://github.com/MrRobotoGit/gostream/releases/latest" target="_blank" rel="noopener" style="display:none; background:#e67e22; cursor:pointer; text-decoration:none; color:#fff;" title="A new version is available">Update Available</a>
             <div class="header-controls"><a href="https://github.com/sponsors/MrRobotoGit" target="_blank"
                     rel="noopener" title="Star on GitHub"><img
                         src="https://img.shields.io/static/v1?label=DONATE&message=%E2%9D%A4&logo=GitHub"
@@ -1582,11 +1583,29 @@
             } catch (e) { console.error('runSyncNow error', e); }
         }
 
+        // --- Update badge ---
+        async function checkUpdate() {
+            try {
+                const res = await fetch('/metrics');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.update_available && data.latest_version) {
+                    const badge = document.getElementById('update-badge');
+                    const isDev = !data.version || data.version === 'dev';
+                    badge.textContent = isDev ? 'Stable: ' + data.latest_version : 'Update ' + data.latest_version;
+                    badge.style.display = 'inline-block';
+                    badge.title = isDev ? 'Dev build — latest stable: ' + data.latest_version : 'Current: ' + data.version + ' → Latest: ' + data.latest_version;
+                }
+            } catch (_) { }
+        }
+
         // Build pickers then load data
         buildDayPicker('sched-movies-days');
         buildDayPicker('sched-tv-days');
         loadScheduler();
         setInterval(loadScheduler, 30000);
+        checkUpdate();
+        setInterval(checkUpdate, 300000); // 5 min — updater checks GitHub every 12h
 
     </script>
 </body>

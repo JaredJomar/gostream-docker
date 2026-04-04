@@ -20,6 +20,7 @@ import (
 	"gostream/internal/prowlarr"
 	"gostream/internal/syncer/engines"
 	"gostream/internal/syncer/scheduler"
+	"gostream/internal/updater"
 	"io"
 	"log"
 	"net"
@@ -2833,10 +2834,7 @@ func main() {
 
 	if globalConfig.BlockListURL != "" {
 		safeGo(func() {
-			// Initial update
 			updateBlockList(globalConfig.BlockListURL)
-
-			// Periodic update every 24 hours
 			ticker := time.NewTicker(24 * time.Hour)
 			defer ticker.Stop()
 			for {
@@ -2849,6 +2847,10 @@ func main() {
 			}
 		})
 	}
+
+	safeGo(func() {
+		updater.Start(AppVersion, backgroundStopChan)
+	})
 
 	peerPreloader = NewPeerPreloader(nativeBridge)
 
@@ -2929,7 +2931,8 @@ func main() {
 
 		natPort := atomic.LoadInt64(&currentNatPort)
 
-		fmt.Fprintf(w, `{"version":"V265-Stable", "config_source":"%s", "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d}`,
+		fmt.Fprintf(w, `{"version":"%s", "config_source":"%s", "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d, "latest_version":"%s", "update_available":%t}`,
+			AppVersion,
 			globalConfig.ConfigPath,
 			time.Since(startTime),
 			cacheStats.Entries, float64(cacheStats.Size)/(1024*1024),
@@ -2943,7 +2946,8 @@ func main() {
 			globalConfig.MaxConnsPerHost,
 			raTotal, raActive, raStale, raEntries, raBudget,
 			raPercent, raActivePercent, raStalePercent,
-			natPort)
+			natPort,
+			updater.LatestVersion(), updater.UpdateAvailable())
 	})
 
 	http.HandleFunc("/webhook", handlePlexWebhook)
@@ -2951,7 +2955,8 @@ func main() {
 	http.HandleFunc("/metrics/profiling", func(w http.ResponseWriter, r *http.Request) {
 		totalReads, cacheHits, httpFetches, streamingReads, avgHTTPLatency, avgCacheLatency, cacheHitRate := globalProfilingStats.Stats()
 
-		fmt.Fprintf(w, `{"version":"V155-Unified", "total_reads":%d, "cache_hits":%d, "cache_hit_rate_pct":%.2f, "http_fetches":%d, "streaming_reads":%d, "non_streaming_reads":%d, "avg_http_latency_ms":%.2f, "avg_cache_latency_ms":%.2f, "max_conns_per_host":%d}`,
+		fmt.Fprintf(w, `{"version":"%s", "total_reads":%d, "cache_hits":%d, "cache_hit_rate_pct":%.2f, "http_fetches":%d, "streaming_reads":%d, "non_streaming_reads":%d, "avg_http_latency_ms":%.2f, "avg_cache_latency_ms":%.2f, "max_conns_per_host":%d}`,
+			AppVersion,
 			totalReads,
 			cacheHits,
 			cacheHitRate,

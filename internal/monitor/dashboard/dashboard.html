@@ -20,11 +20,14 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
 <div class="max-w-7xl mx-auto">
 
 <!-- Header -->
-<div class="flex items-center justify-between mb-6">
-  <h1 class="text-2xl md:text-3xl font-bold">GoStream Health Monitor</h1>
-  <div class="flex items-center gap-4">
-    <span class="text-sm text-slate-400">Last update: <span id="lastUpdate">--:--:--</span></span>
-    <button onclick="doRestart()" class="bg-slate-700 hover:bg-red-600 text-white text-xs py-1.5 px-3 rounded transition">Restart GoStream</button>
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-6">
+  <div class="flex items-center gap-3">
+    <h1 class="text-2xl md:text-3xl font-bold">GoStream Health Monitor</h1>
+    <a id="updateBadge" href="https://github.com/MrRobotoGit/gostream/releases/latest" target="_blank" rel="noopener" class="hidden bg-amber-600 hover:bg-amber-500 text-white text-xs font-medium py-1 px-2.5 rounded-full transition no-underline whitespace-nowrap"></a>
+  </div>
+  <div class="flex items-center gap-3">
+    <span class="text-xs text-slate-400">Last update: <span id="lastUpdate">--:--:--</span></span>
+    <button onclick="doRestart()" class="bg-slate-700 hover:bg-red-600 text-white text-xs py-1.5 px-3 rounded transition whitespace-nowrap">Restart</button>
   </div>
 </div>
 
@@ -290,11 +293,27 @@ function doRestart(){
   }).catch(()=>{});
 }
 
+async function checkUpdate(){
+  try{
+    const r=await fetch('/metrics');if(!r.ok)return;
+    const d=await r.json();
+    if(d.update_available&&d.latest_version){
+      const b=document.getElementById('updateBadge');
+      const isDev=!d.version||d.version==='dev';
+      b.textContent=isDev?'Stable: '+d.latest_version:'Update '+d.latest_version;
+      b.title=isDev?'Dev build — latest stable: '+d.latest_version:'Current: '+d.version+' → '+d.latest_version;
+      b.classList.remove('hidden');
+    }
+  }catch(_){}
+}
+
 initChart();
 load();
 loadLogs();
+checkUpdate();
 setInterval(load,5000);
 setInterval(loadLogs,15000);
+setInterval(checkUpdate,300000);
 </script>
 </body>
 </html>
