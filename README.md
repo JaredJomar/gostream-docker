@@ -13,7 +13,7 @@ GoStream exposes a **custom FUSE virtual filesystem** where every `.mkv` file is
 
 The BitTorrent engine runs **inside the same OS process** as the FUSE layer, connected by an in-memory `io.Pipe()`. When Plex/Jellyfin reads a byte range, there is no HTTP round-trip, no serialization, no proxy overhead — just bytes, flowing directly from peers through RAM to the media server at full speed.
 
-The result: **4K HDR Dolby Vision**, fully seekable, on a **Raspberry Pi 4**, starting in 0.1 seconds.
+The result: **4K HDR Dolby Vision**, fully seekable, starting in 0.1 seconds — even on a **Raspberry Pi 4**.
 
 This is not a torrent client with a media server bolted on. The FUSE filesystem *is* the product — custom-built from scratch around the constraints of torrent streaming: non-sequential byte-range requests, multi-gigabyte files that must be seekable at any position, and a Plex/Jellyfin scanner that probes every file in a library of hundreds of titles on startup.
 
@@ -75,11 +75,11 @@ This is not a torrent client with a media server bolted on. The FUSE filesystem 
 ![Plex library populated by sync scripts](docs/screenshots/library.png)
 
 
-**The end result**: you open Infuse on your Apple TV, your entire movie library appears with posters and metadata, you press Play on a 4K Dolby Vision film and it starts in under a second. No buffering. No "downloading...". No subscription to Real-Debrid or any external service. Everything runs on a Raspberry Pi in your home.
+**The end result**: you open Infuse on your Apple TV, your entire movie library appears with posters and metadata, you press Play on a 4K Dolby Vision film and it starts in under a second. No buffering. No "downloading...". No subscription to Real-Debrid or any external service. Everything runs on a single board computer or any always-on Linux box in your home.
 
 ### How the three pieces fit together
 
-**GoStream** runs on the Raspberry Pi. It creates a virtual hard drive that looks completely real to the rest of your network: it contains thousands of `.mkv` files, each the correct size, each seekable. In reality, none of those files exist on disk. When anything reads a byte, GoStream silently fetches it in real-time from the BitTorrent network and passes it through.
+**GoStream** runs on your Linux device — a Raspberry Pi, a NAS, a VPS, or any always-on machine. It creates a virtual hard drive that looks completely real to the rest of your network: it contains thousands of `.mkv` files, each the correct size, each seekable. In reality, none of those files exist on disk. When anything reads a byte, GoStream silently fetches it in real-time from the BitTorrent network and passes it through.
 
 **Plex** (or **Jellyfin**, or any media server) sees this virtual hard drive as a normal media library. It scans the files, downloads posters and descriptions from the internet, tracks what you've watched, and makes everything available on your home network, just like it would with a real NAS.
 
@@ -322,7 +322,7 @@ GoStorm is a fork of **[TorrServer Matrix 1.37](https://github.com/YouROK/TorrSe
 
 ## Performance
 
-> All measurements on **Raspberry Pi 4** (4 GB RAM, Cortex-A72, arm64, no hardware crypto).
+> Measurements on **Raspberry Pi 4** (4 GB RAM, Cortex-A72, arm64, no hardware crypto) — the minimum supported baseline. Performance is higher on amd64 or more powerful arm64 hardware.
 
 | Metric | Value |
 |--------|-------|
@@ -345,8 +345,8 @@ GoStorm is a fork of **[TorrServer Matrix 1.37](https://github.com/YouROK/TorrSe
 
 | Component | Details |
 |-----------|---------|
-| **Hardware** | Raspberry Pi 4 with arm64 OS (4 GB RAM recommended) |
-| **Go** | 1.24+ — must be `linux/arm64` toolchain, **not** `linux/arm` (32-bit) |
+| **Hardware** | Any `linux/amd64` or `linux/arm64` device — **Raspberry Pi 4 is the minimum tested baseline** (4 GB RAM recommended). Runs on NAS, VPS, mini-PC, or any always-on Linux box. |
+| **Go** | 1.24+ (`linux/amd64` or `linux/arm64`) — do **not** use the 32-bit `linux/arm` toolchain |
 | **FUSE 3** | `sudo apt install fuse3 libfuse3-dev` |
 | **systemd** | For service management |
 | **Samba** | `sudo apt install samba` |
@@ -819,7 +819,7 @@ Options: serverino,vers=3.0,uid=1024,gid=100,file_mode=0777,dir_mode=0777
 ## Build from Source
 
 > [!IMPORTANT]
-> Compile natively on Pi 4 (arm64). Do not cross-compile — the PGO profile must match the target architecture.
+> Compile natively on the target machine. Do not cross-compile — the PGO profile must match the target CPU architecture.
 
 ```bash
 ssh pi@192.168.1.2
