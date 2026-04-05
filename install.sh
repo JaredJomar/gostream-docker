@@ -807,17 +807,22 @@ compile_binary() {
     local go_tmp="${HOME}/go-tmp"
     mkdir -p "${go_tmp}"
 
-    # Embed version from git tag into the binary
-    # If no tag found, skip -ldflags so the hardcoded version.go value takes effect
+    # Embed version: try local git tag first, then GitHub API, then version.go
     local app_version
     app_version=$(git describe --tags --abbrev=0 2>/dev/null || true)
+
+    if [ -z "$app_version" ] && command -v curl >/dev/null 2>&1; then
+        app_version=$(curl -fsSL --max-time 5 \
+            "https://api.github.com/repos/MrRobotoGit/gostream/releases/latest" \
+            2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    fi
 
     local ldflags=""
     if [ -n "$app_version" ]; then
         ldflags="-X main.AppVersion=${app_version}"
-        print_info "Embedding version: ${app_version} (from git tag)"
+        print_info "Embedding version: ${app_version}"
     else
-        print_info "No git tag found — using hardcoded version from version.go"
+        print_info "No version tag found — using hardcoded version from version.go"
     fi
 
     print_info "Building binary (GOARCH=${GO_ARCH}, -p 2)..."
@@ -978,66 +983,65 @@ show_summary() {
     local BG=""
     [ "${_ncolors:-8}" -ge 256 ] && BG=$'\e[48;5;235m'
 
-    local bi=$(( cols - 6 ))   # box inner width
+    local bi=$(( cols - 6 ))   # box inner width (chars between ║ and ║)
     local _i
 
-    # ── Control Panel ────────────────────────────────────────────────────────
-    local cp_label="Plex · TMDB · NAT-PMP · Ports · Scheduler · Webhooks"
-    local cp_url="http://<your-ip>:9080/control"
-    local cp_title="  Control Panel  "
-    local cp_title_len=${#cp_title}
-    local cp_label_pad=$(( (bi - ${#cp_label}) / 2 ))
-    local cp_url_pad=$(( (bi - ${#cp_url}) / 2 ))
+    # Draw top border with title embedded in it
+    # Total inner = 1(═) + title_len + rest(═) = bi  ✓
+    _btop() {
+        local t="$1" tl=${#1}
+        local rest=$(( bi - tl - 1 ))
+        [ $rest -lt 0 ] && rest=0
+        printf "  %s%s╔═%s%s" "$PBOX" "$BOLD" "$t" "$PBOX$BOLD"
+        for ((_i=0; _i<rest; _i++)); do printf "═"; done
+        printf "╗%s\n" "$PRST$NC"
+    }
+
+    # Draw a centered text line inside the box
+    # Total inner = lpad + text_len + rpad = bi  ✓
+    _bline() {
+        local t="$1" fc="${2:-$PRST}"
+        local tl=${#t}
+        local lp=$(( (bi - tl) / 2 ))
+        local rp=$(( bi - lp - tl ))
+        [ $lp -lt 0 ] && lp=0
+        [ $rp -lt 0 ] && rp=0
+        printf "  %s║%s" "$PBOX$BOLD" "$BG"
+        printf "%${lp}s" ""
+        printf "%s%s%s" "$fc" "$t" "$PRST"
+        printf "%s%${rp}s" "$BG" ""
+        printf "%s║%s\n" "$PRST$PBOX$BOLD" "$PRST$NC"
+    }
+
+    # Draw a blank line inside the box
+    _bblank() {
+        printf "  %s║%s%${bi}s%s║%s\n" \
+            "$PBOX$BOLD" "$BG" "" "$PRST$PBOX$BOLD" "$PRST$NC"
+    }
+
+    # Draw bottom border
+    _bbot() {
+        printf "  %s%s╚" "$PBOX" "$BOLD"
+        for ((_i=0; _i<bi; _i++)); do printf "═"; done
+        printf "╝%s\n" "$PRST$NC"
+    }
 
     printf "\n"
-    # Top border with title embedded
-    printf "  %s%s╔═%s%s%s%s" "$PBOX" "$BOLD" "$cp_title" "$PBOX$BOLD" "" ""
-    for ((_i=cp_title_len+2; _i<bi; _i++)); do printf "═"; done
-    printf "╗%s\n" "$PRST$NC"
-    # Subtitle (features)
-    printf "  %s%s║%s%s%*s%s%s%*s%s%s║%s\n" \
-        "$PBOX$BOLD" "" "$BG$PSUB" \
-        "" "$cp_label_pad" "" "$cp_label" \
-        "" "$cp_label_pad" "$PRST" \
-        "$PBOX$BOLD" "$PRST$NC"
-    # Blank
-    printf "  %s%s║%s%s%*s%s%s║%s\n" \
-        "$PBOX$BOLD" "" "$BG" "" "$bi" "" "$PRST" "$PBOX$BOLD" "$PRST$NC"
-    # URL
-    printf "  %s%s║%s%s%*s%s%s%s%*s%s%s║%s\n" \
-        "$PBOX$BOLD" "" "$BG" \
-        "" "$cp_url_pad" "" "$BOLD$P4" "$cp_url" "$NC" \
-        "" "$cp_url_pad" "$PRST" \
-        "$PBOX$BOLD" "$PRST$NC"
-    # Bottom border
-    printf "  %s%s╚" "$PBOX" "$BOLD"
-    for ((_i=0; _i<bi; _i++)); do printf "═"; done
-    printf "╝%s\n" "$PRST$NC"
+
+    # ── Control Panel ────────────────────────────────────────────────────────
+    _btop "  Control Panel  "
+    _bline "Plex · TMDB · NAT-PMP · Ports · Scheduler · Webhooks" "$PSUB"
+    _bblank
+    _bline "http://<your-ip>:9080/control" "$BOLD$P4"
+    _bbot
 
     echo ""
 
     # ── Dashboard ────────────────────────────────────────────────────────────
-    local db_url="http://<your-ip>:9080/dashboard"
-    local db_title="  Dashboard  "
-    local db_title_len=${#db_title}
-    local db_url_pad=$(( (bi - ${#db_url}) / 2 ))
-
-    printf "  %s%s╔═%s%s%s" "$PBOX" "$BOLD" "$db_title" "$PBOX$BOLD" ""
-    for ((_i=db_title_len+2; _i<bi; _i++)); do printf "═"; done
-    printf "╗%s\n" "$PRST$NC"
-    # Blank
-    printf "  %s%s║%s%s%*s%s%s║%s\n" \
-        "$PBOX$BOLD" "" "$BG" "" "$bi" "" "$PRST" "$PBOX$BOLD" "$PRST$NC"
-    # URL
-    printf "  %s%s║%s%s%*s%s%s%s%*s%s%s║%s\n" \
-        "$PBOX$BOLD" "" "$BG" \
-        "" "$db_url_pad" "" "$BOLD$P4" "$db_url" "$NC" \
-        "" "$db_url_pad" "$PRST" \
-        "$PBOX$BOLD" "$PRST$NC"
-    # Bottom border
-    printf "  %s%s╚" "$PBOX" "$BOLD"
-    for ((_i=0; _i<bi; _i++)); do printf "═"; done
-    printf "╝%s\n" "$PRST$NC"
+    _btop "  Dashboard  "
+    _bblank
+    _bline "http://<your-ip>:9080/dashboard" "$BOLD$P4"
+    _bbot
 
     echo ""
 }

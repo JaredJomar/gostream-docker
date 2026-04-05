@@ -2829,7 +2829,28 @@ func main() {
 	nativeBridge = NewNativeClient()
 
 	if globalConfig.AIURL != "" {
-		go ai.StartAITuner(context.Background(), globalConfig.AIURL)
+		provider := ai.AIProvider{
+			URL:     globalConfig.AIURL,
+			APIKey:  globalConfig.AI_API_KEY,
+			Model:   globalConfig.AIModel,
+			IsLocal: globalConfig.AIProvider == "" || globalConfig.AIProvider == "local",
+			GetBufferPct: func() int {
+				total, _, _ := raCache.Stats()
+				budget := globalConfig.ReadAheadBudget
+				if budget <= 0 {
+					return 100
+				}
+				pct := int(total * 100 / budget)
+				if pct > 100 {
+					pct = 100
+				}
+				return pct
+			},
+			OnBadSwarm: func(hash, title string) {
+				log.Printf("[AI-Pilot] SwarmQuality: Triggering alternative search for: %s", title)
+			},
+		}
+		go ai.StartAITuner(context.Background(), provider)
 	}
 
 	if globalConfig.BlockListURL != "" {
