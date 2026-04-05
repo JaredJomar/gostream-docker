@@ -84,10 +84,13 @@ func NewWatchlistGoEngine(cfg WatchlistConfig) *WatchlistGoEngine {
 func (e *WatchlistGoEngine) Name() string { return "watchlist" }
 
 func (e *WatchlistGoEngine) Run(ctx context.Context) error {
+	e.logger.Printf("[WatchlistSync] Starting sync")
 	items, err := e.fetchWatchlist(ctx)
 	if err != nil {
+		e.logger.Printf("[WatchlistSync] Failed to fetch watchlist: %v", err)
 		return fmt.Errorf("fetch watchlist: %w", err)
 	}
+	e.logger.Printf("[WatchlistSync] Watchlist items: %d", len(items))
 	if len(items) == 0 {
 		return nil
 	}
@@ -196,6 +199,7 @@ func (e *WatchlistGoEngine) Run(ctx context.Context) error {
 		}
 	}
 
+	e.logger.Printf("[WatchlistSync] Done: %d added, %d skipped", added, skipped)
 	if added > 0 {
 		e.mediasrv.RefreshLibrary(context.Background(), e.sectionID)
 	}

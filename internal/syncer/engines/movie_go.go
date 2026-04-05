@@ -184,21 +184,21 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 func (e *MovieGoEngine) Name() string { return "movies" }
 
 func (e *MovieGoEngine) Run(ctx context.Context) error {
-	log.Printf("[MovieSync] Starting discovery...")
+	e.logger.Printf("[MovieSync] Starting discovery...")
 	movies, err := e.discoverMovies(ctx)
 	if err != nil {
 		return fmt.Errorf("discover movies: %w", err)
 	}
-	log.Printf("[MovieSync] Discovered %d movies", len(movies))
+	e.logger.Printf("[MovieSync] Discovered %d movies", len(movies))
 
 	existingIndex, diskHashes := e.buildExistingMovieIndex()
-	log.Printf("[MovieSync] Existing index: %d movies, %d hashes on disk", len(existingIndex), len(diskHashes))
+	e.logger.Printf("[MovieSync] Existing index: %d movies, %d hashes on disk", len(existingIndex), len(diskHashes))
 
 	created := 0
 	for i, m := range movies {
 		select {
 		case <-ctx.Done():
-			log.Printf("[MovieSync] Stopped after %d/%d movies (%d created)", i, len(movies), created)
+			e.logger.Printf("[MovieSync] Stopped after %d/%d movies (%d created)", i, len(movies), created)
 			return ctx.Err()
 		default:
 		}
@@ -209,7 +209,7 @@ func (e *MovieGoEngine) Run(ctx context.Context) error {
 		time.Sleep(mMovieProcessSleep)
 	}
 
-	log.Printf("[MovieSync] Processing complete: %d created out of %d discovered", created, len(movies))
+	e.logger.Printf("[MovieSync] Processing complete: %d created out of %d discovered", created, len(movies))
 	e.saveAllCaches()
 	e.rehydrateMissingTorrents(ctx)
 	e.cleanupOrphanedFiles(ctx)
@@ -360,7 +360,7 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 	}
 
 	// Get streams
-	log.Printf("[MovieSync] Processing: %s (%s)", title, imdbID)
+	e.logger.Printf("[MovieSync] Processing: %s (%s)", title, imdbID)
 	streams, err := e.getMovieStreams(ctx, imdbID, title)
 	if err != nil || len(streams) == 0 {
 		e.setCache(e.noStreamsCache, imdbID, CacheEntry{Title: title, TS: time.Now().Unix()})
@@ -430,7 +430,7 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 
 		// Remove existing if upgrading
 		if existingPath != "" {
-			log.Printf("[MovieSync] Upgrade: removing %s", filepath.Base(existingPath))
+			e.logger.Printf("[MovieSync] Upgrade: removing %s", filepath.Base(existingPath))
 			os.Remove(existingPath)
 		}
 
@@ -443,7 +443,7 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 			if !c.Is4K {
 				res = "1080p"
 			}
-			log.Printf("[MovieSync] Created: %s (%s, %.1fGB, score:%d)", filename, res, float64(bestFile.Length)/1024/1024/1024, c.QualityScore)
+			e.logger.Printf("[MovieSync] Created: %s (%s, %.1fGB, score:%d)", filename, res, float64(bestFile.Length)/1024/1024/1024, c.QualityScore)
 			e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "processed", TS: time.Now().Unix()})
 			return true
 		}

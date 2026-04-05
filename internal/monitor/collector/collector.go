@@ -178,6 +178,15 @@ func (c *Collector) SpeedHistory() []SpeedPoint {
 	return out
 }
 
+// PlexURL returns the configured Plex base URL (for server-side proxy use only).
+func (c *Collector) PlexURL() string { return c.plexURL }
+
+// PlexToken returns the configured Plex token (for server-side proxy use only).
+func (c *Collector) PlexToken() string { return c.plexToken }
+
+// GostormURL returns the GoStorm API base URL.
+func (c *Collector) GostormURL() string { return c.gostormURL }
+
 func (c *Collector) collect() {
 	s := HealthStatus{
 		Timestamp:  time.Now(),
@@ -571,10 +580,11 @@ func (c *Collector) enrichTorrents(torrents []TorrentInfo) {
 			t.Channels = "2.0"
 		}
 
-		// Try Plex session match (by hash8 in filename — first 8 chars of InfoHash)
+		// Try Plex session match (by hash8 in filename — LAST 8 chars of InfoHash,
+		// matching the naming convention in buildMovieFilename: hash[len-8:])
 		hash8 := t.Hash
 		if len(hash8) >= 8 {
-			hash8 = hash8[:8]
+			hash8 = hash8[len(hash8)-8:]
 		}
 		if sess, ok := sessions[hash8]; ok {
 			t.CleanTitle = sess.Title
@@ -691,7 +701,9 @@ func (c *Collector) fetchPlexSessions() map[string]plexSession {
 		}
 		poster := ""
 		if thumbPath != "" {
-			poster = fmt.Sprintf("%s%s?X-Plex-Token=%s", c.plexURL, thumbPath, c.plexToken)
+			// Store as proxy path — browser fetches via /api/plex-thumb?p=...
+			// so the Plex URL (often 127.0.0.1) never leaks to the client.
+			poster = "/api/plex-thumb?p=" + thumbPath
 		}
 		for _, media := range v.Media {
 			sess := plexSession{

@@ -3162,6 +3162,8 @@ func main() {
 	http.HandleFunc("/api/torrents", dashHandler.Torrents)
 	http.HandleFunc("/api/speed-history", dashHandler.SpeedHistory)
 	http.HandleFunc("/api/logs", dashHandler.Logs)
+	http.HandleFunc("/api/plex-thumb", dashHandler.PlexThumb)
+	http.HandleFunc("/api/kill-stream/", dashHandler.KillStream)
 	safeGo(func() {
 		monCollector.Run(backgroundStopChan)
 	})

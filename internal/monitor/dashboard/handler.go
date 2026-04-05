@@ -3,6 +3,8 @@ package dashboard
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -104,6 +106,63 @@ func tailFile(path string, n int) []string {
 		all = all[len(all)-n:]
 	}
 	return all
+}
+
+// KillStream forwards a drop request to GoStorm for the given torrent hash.
+func (h *Handler) KillStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"status":"error","message":"method not allowed"}`))
+		return
+	}
+	hash := strings.TrimPrefix(r.URL.Path, "/api/kill-stream/")
+	if hash == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"status":"error","message":"missing hash"}`))
+		return
+	}
+	body := fmt.Sprintf(`{"action":"drop","hash":%q}`, hash)
+	resp, err := http.Post(h.collector.GostormURL()+"/torrents", "application/json", strings.NewReader(body))
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"status":"error","message":%q}`, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		w.Write([]byte(`{"status":"ok"}`))
+	} else {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"status":"error","message":"gostorm returned %s"}`, resp.Status)
+	}
+}
+
+// PlexThumb proxies a Plex thumbnail through gostream.
+// This avoids exposing the Plex token in client-side HTML/JS and decouples
+// the browser from the configured plex_url (which may not be directly reachable
+// from the client network).
+func (h *Handler) PlexThumb(w http.ResponseWriter, r *http.Request) {
+	thumbPath := r.URL.Query().Get("p")
+	if thumbPath == "" || h.collector.PlexURL() == "" {
+		http.NotFound(w, r)
+		return
+	}
+	url := h.collector.PlexURL() + thumbPath + "?X-Plex-Token=" + h.collector.PlexToken()
+	resp, err := http.Get(url) //nolint:noctx
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		http.NotFound(w, r)
+		return
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	io.Copy(w, resp.Body) //nolint:errcheck
 }
 
 func atoi(s string) int {
