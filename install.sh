@@ -7,7 +7,7 @@
 set -e
 
 # ------------------------------------------------------------------------------
-# Color output (graceful fallback when not running in a terminal)
+# Color output — standard 8-color + 256-color palette
 # ------------------------------------------------------------------------------
 if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
     RED=$(tput setaf 1)
@@ -16,6 +16,7 @@ if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
     BLUE=$(tput setaf 4)
     BOLD=$(tput bold)
     NC=$(tput sgr0)
+    _ncolors=$(tput colors 2>/dev/null || echo 8)
 else
     RED='\033[0;31m'
     GREEN='\033[0;32m'
@@ -23,43 +24,222 @@ else
     BLUE='\033[0;34m'
     BOLD='\033[1m'
     NC='\033[0m'
+    _ncolors=8
+fi
+
+# 256-color palette (ANSI 38;5;N — falls back to standard colors)
+if [ "${_ncolors:-8}" -ge 256 ] 2>/dev/null; then
+    P1=$'\e[38;5;27m'    # deep blue       (logo line 1)
+    P2=$'\e[38;5;33m'    # blue            (logo line 2)
+    P3=$'\e[38;5;39m'    # blue-cyan       (logo line 3)
+    P4=$'\e[38;5;45m'    # cyan            (logo line 4)
+    P5=$'\e[38;5;51m'    # bright cyan     (logo line 5/6)
+    PDIM=$'\e[38;5;240m' # dark gray       (decorative lines)
+    PSUB=$'\e[38;5;246m' # medium gray     (subtitle / payoff)
+    PGRN=$'\e[38;5;82m'  # bright green    (ok icon)
+    PYLW=$'\e[38;5;220m' # amber           (warn icon)
+    PRED=$'\e[38;5;196m' # bright red      (err icon)
+    PTEAL=$'\e[38;5;45m' # teal            (header accent)
+    PBOX=$'\e[38;5;33m'  # blue            (summary box)
+    PRST=$'\e[0m'
+else
+    P1="$BLUE"; P2="$BLUE"; P3="$BLUE"; P4="$BLUE"; P5="$BLUE"
+    PDIM="$NC"; PSUB="$NC"; PGRN="$GREEN"; PYLW="$YELLOW"; PRED="$RED"
+    PTEAL="$BLUE"; PBOX="$BLUE"; PRST="$NC"
 fi
 
 # ------------------------------------------------------------------------------
-# Helper: print a colored section header
+# Terminal width helpers
 # ------------------------------------------------------------------------------
-print_header() {
+get_cols() { tput cols 2>/dev/null || echo 80; }
+
+# Full-width horizontal rule: print_hr [color] [char]
+print_hr() {
+    local col="${1:-$PDIM}" char="${2:-─}"
+    local w; w=$(get_cols)
+    printf "%s  " "$col"
+    local _i; for ((_i=0; _i<w-4; _i++)); do printf "%s" "$char"; done
+    printf "%s\n" "$PRST"
+}
+
+# Centered wizard form: width of the centered block and its left padding
+FORM_W=64
+form_pad() {
+    local cols; cols=$(get_cols)
+    local p=$(( (cols - FORM_W) / 2 ))
+    echo $(( p < 2 ? 2 : p ))
+}
+
+# ------------------------------------------------------------------------------
+# Funny messages — one per phase category
+# ------------------------------------------------------------------------------
+_MSGS_SETUP=(
+    "OMG am I doing this for real?! Say goodbye to my grades."
+    "Am I ditching all the other services? Sorry Netflix, it's not me, it's definitely you."
+    "Look at me saving money for more beers... I mean, 'soda'. Obviously."
+)
+_MSGS_WORK=(
+    "Loading... honestly, I'm just as bored as you are right now."
+    "Wait, I'm actually working? Someone call my mom, she won't believe it."
+    "Don't mind me, just downloading your next 3 a.m. obsession."
+)
+_MSGS_DONE=(
+    "Aaaand done. Now go rot on the couch like the legend you are."
+    "We're in. If anyone asks, you're 'studying'. I got your back."
+    "Setup finished. Go ahead, ignore those 47 unread texts. You deserve this."
+)
+
+# Pick a random element from a named array (bash 3.2 compatible — no nameref)
+pick_msg() {
+    local _arr="$1"
+    local _len; eval "_len=\${#${_arr}[@]}"
+    [ "$_len" -eq 0 ] && return
+    local _idx=$(( RANDOM % _len ))
+    eval "echo \"\${${_arr}[$_idx]}\""
+}
+
+# ------------------------------------------------------------------------------
+# Progress bar for [3/3] Install phase
+# ------------------------------------------------------------------------------
+_STEP=0
+_STEPS=9  # clone, deploy, config, dirs, services, enable, sudoers, compile, verify
+
+step_start() {
+    (( _STEP++ )) || true
+    local label="$1"
+    local cols; cols=$(get_cols)
+    local msg; msg=$(pick_msg _MSGS_WORK)
+
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    draw_logo
+
+    local bar_w=$(( cols - 16 ))
+    local _i
+
+    # Phase bar — always 3/3, pre-filled to 2/3
+    local ph_filled=$(( bar_w * 2 / 3 ))
+    local ph_empty=$(( bar_w - ph_filled ))
+    printf "  %s" "$P3"
+    for ((_i=0; _i<ph_filled; _i++)); do printf "█"; done
+    printf "%s" "$PDIM"
+    for ((_i=0; _i<ph_empty; _i++)); do printf "░"; done
+    printf "%s  %sPhase 3/3%s\n" "$PRST" "$PSUB" "$PRST"
+    printf "  %s%s◆  [3/3] Installing%s%s\n\n" "$PTEAL$BOLD" "$PRST" "$NC$PRST" ""
+
+    # Step bar — secondary (▓ fill char to distinguish from phase bar)
+    local st_filled=$(( bar_w * _STEP / _STEPS ))
+    local st_empty=$(( bar_w - st_filled ))
+    printf "  %s" "$P4"
+    for ((_i=0; _i<st_filled; _i++)); do printf "▓"; done
+    printf "%s" "$PDIM"
+    for ((_i=0; _i<st_empty; _i++)); do printf "░"; done
+    printf "%s  %s%d/%d%s\n" "$PRST" "$PSUB" "$_STEP" "$_STEPS" "$PRST"
     echo ""
-    echo "${BOLD}${BLUE}=== $1 ===${NC}"
+    printf "  %s▸  %s%s%s\n" "$PTEAL" "$BOLD" "$label" "$NC$PRST"
+    echo ""
+    printf "  %s%s%s\n" "$PSUB" "$msg" "$PRST"
+    print_hr "$PDIM"
     echo ""
 }
 
-print_ok()   { echo "  ${GREEN}✓${NC} $1"; }
-print_warn() { echo "  ${YELLOW}⚠${NC}  $1"; }
-print_err()  { echo "  ${RED}✗${NC} $1"; }
-print_info() { echo "  ${BLUE}→${NC} $1"; }
+# ------------------------------------------------------------------------------
+# draw_logo — full 6-line GOSTREAM ASCII logo (centered, used on splash + summary)
+# ------------------------------------------------------------------------------
+draw_logo() {
+    local cols; cols=$(get_cols)
+    local pad=$(( (cols - 72) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+    local sp; printf -v sp '%*s' "$pad" ''
+
+    echo ""
+    printf "%s%s██████╗  ██████╗ ███████╗████████╗██████╗ ███████╗ █████╗ ███╗   ███╗%s\n"  "$P2" "$sp" "$PRST"
+    printf "%s%s██╔════╝ ██╔═══██╗██╔════╝╚══██╔══╝██╔══██╗██╔════╝██╔══██╗████╗ ████║%s\n" "$P3" "$sp" "$PRST"
+    printf "%s%s██║  ███╗██║   ██║███████╗   ██║   ██████╔╝█████╗  ███████║██╔████╔██║%s\n"  "$P4" "$sp" "$PRST"
+    printf "%s%s██║   ██║██║   ██║╚════██║   ██║   ██╔══██╗██╔══╝  ██╔══██║██║╚██╔╝██║%s\n" "$P4" "$sp" "$PRST"
+    printf "%s%s╚██████╔╝╚██████╔╝███████║   ██║   ██║  ██║███████╗██║  ██║██║ ╚═╝ ██║%s\n" "$P3" "$sp" "$PRST"
+    printf "%s%s ╚═════╝  ╚═════╝ ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝%s\n" "$P2" "$sp" "$PRST"
+    echo ""
+    local payoff="✦  The Torrent Service  ✦"
+    local ppad=$(( (cols - ${#payoff}) / 2 ))
+    [ "$ppad" -lt 0 ] && ppad=0
+    printf "%*s%s%s%s\n" "$ppad" "" "$PSUB" "$payoff" "$PRST"
+    echo ""
+    echo ""
+}
+
+# ------------------------------------------------------------------------------
+# draw_header — compact 1-line brand strip for wizard/install screens
+# ------------------------------------------------------------------------------
+draw_header() {
+    local cols; cols=$(get_cols)
+    local brand="  G O S T R E A M  ✦  The Torrent Service · Installer"
+    local bp=$(( (cols - ${#brand}) / 2 ))
+    [ "$bp" -lt 0 ] && bp=0
+    printf "\n%*s%s%s%s%s\n" "$bp" "" "$P4$BOLD" "$brand" "$NC$PRST"
+    print_hr "$PDIM"
+}
+
+# ------------------------------------------------------------------------------
+# wizard_header — clears screen, draws compact header + phase progress bar
+# Usage: wizard_header "Phase Title" current_step total_steps
+# ------------------------------------------------------------------------------
+wizard_header() {
+    local title="$1" step="${2:-1}" total="${3:-3}"
+    local cols; cols=$(get_cols)
+    local msg
+    [ "$step" -lt "$total" ] && msg=$(pick_msg _MSGS_SETUP) || msg=$(pick_msg _MSGS_WORK)
+
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    draw_logo
+
+    local bar_w=$(( cols - 16 ))
+    local filled=$(( bar_w * step / total ))
+    local empty=$(( bar_w - filled ))
+    printf "  %s" "$P3"
+    local _i; for ((_i=0; _i<filled; _i++)); do printf "█"; done
+    printf "%s" "$PDIM"
+    for ((_i=0; _i<empty; _i++)); do printf "░"; done
+    printf "%s  %sPhase %d/%d%s\n" "$PRST" "$PSUB" "$step" "$total" "$PRST"
+    echo ""
+    printf "  %s%s◆  %s%s\n" "$PTEAL" "$BOLD" "$title" "$NC$PRST"
+    echo ""
+    printf "  %s%s%s\n" "$PSUB" "$msg" "$PRST"
+    print_hr "$PDIM"
+    echo ""
+}
+
+# ------------------------------------------------------------------------------
+# Helper: print a colored section header (full-width separator, no clear)
+# ------------------------------------------------------------------------------
+print_header() {
+    echo ""
+    printf "  %s%s◆  %s%s%s\n" "$PTEAL" "$BOLD" "$1" "$NC" "$PRST"
+    print_hr "$PDIM"
+    echo ""
+}
+
+print_ok()   { printf "  %s✔%s  %s\n" "$PGRN"  "$PRST" "$1"; }
+print_warn() { printf "  %s⚠%s   %s\n" "$PYLW"  "$PRST" "$1"; }
+print_err()  { printf "  %s✘%s  %s\n" "$PRED"  "$PRST" "$1"; }
+print_info() { printf "  %s→%s  %s\n" "$PTEAL" "$PRST" "$1"; }
 
 # ------------------------------------------------------------------------------
 # Helper: ask "Prompt" "default" VAR_NAME
 #   Displays [default] hint; if user presses Enter, uses default.
 # ------------------------------------------------------------------------------
 ask() {
-    local prompt="$1"
-    local default="$2"
-    local var_name="$3"
-    local user_input
+    local prompt="$1" default="$2" var_name="$3" user_input
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
 
+    echo ""
+    printf "%s%s%s%s\n" "$sp" "$BOLD" "$prompt" "$NC"
     if [ -n "$default" ]; then
-        printf "  %s [%s]: " "$prompt" "$default"
-    else
-        printf "  %s: " "$prompt"
+        printf "%s%sDefault:%s %s\n" "$sp" "$PSUB" "$PRST" "$default"
     fi
-
+    printf "%s%s❯%s " "$sp" "$P4" "$PRST"
     read -r user_input
-    if [ -z "$user_input" ]; then
-        user_input="$default"
-    fi
-    # Assign to the caller's variable by name
+    [ -z "$user_input" ] && user_input="$default"
     printf -v "$var_name" '%s' "$user_input"
 }
 
@@ -68,13 +248,16 @@ ask() {
 #   Hidden input (no echo); no default shown for security.
 # ------------------------------------------------------------------------------
 ask_secret() {
-    local prompt="$1"
-    local var_name="$2"
-    local user_input
+    local prompt="$1" var_name="$2" user_input
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
 
-    printf "  %s: " "$prompt"
+    echo ""
+    printf "%s%s%s%s\n" "$sp" "$BOLD" "$prompt" "$NC"
+    printf "%s%s(hidden input)%s\n" "$sp" "$PSUB" "$PRST"
+    printf "%s%s❯%s " "$sp" "$P4" "$PRST"
     read -rs user_input
-    echo ""  # newline after hidden input
+    echo ""
     printf -v "$var_name" '%s' "$user_input"
 }
 
@@ -84,22 +267,22 @@ ask_secret() {
 #   default_yn should be "y" or "n" (case-insensitive).
 # ------------------------------------------------------------------------------
 ask_yn() {
-    local question="$1"
-    local default="${2:-n}"
-    local hint user_input
+    local question="$1" default="${2:-n}" hint user_input
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
 
     if [ "${default,,}" = "y" ]; then
-        hint="Y/n"
+        hint="${PGRN}${BOLD}Yes${NC}${PRST}  ${PDIM}/  No${PRST}  ${PSUB}(recommended: Yes)${PRST}"
     else
-        hint="y/N"
+        hint="${PDIM}Yes  /${PRST}  ${PRED}${BOLD}No${NC}${PRST}  ${PSUB}(recommended: No)${PRST}"
     fi
 
-    printf "  %s [%s]: " "$question" "$hint"
+    echo ""
+    printf "%s%s%s%s\n" "$sp" "$BOLD" "$question" "$NC"
+    printf "%s%s%s\n" "$sp" "$hint" "$PRST"
+    printf "%s%s❯%s " "$sp" "$P4" "$PRST"
     read -r user_input
-
-    if [ -z "$user_input" ]; then
-        user_input="$default"
-    fi
+    [ -z "$user_input" ] && user_input="$default"
 
     case "${user_input,,}" in
         y|yes) return 0 ;;
@@ -108,18 +291,26 @@ ask_yn() {
 }
 
 # ------------------------------------------------------------------------------
-# ASCII Banner
+# show_banner — full-screen splash (clears terminal, waits for Enter)
 # ------------------------------------------------------------------------------
 show_banner() {
+    local cols; cols=$(get_cols)
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+
+    draw_logo
+
     echo ""
-    echo "${BOLD}${BLUE}╔══════════════════════════════════════╗${NC}"
-    echo "${BOLD}${BLUE}║          GoStream Installer          ║${NC}"
-    echo "${BOLD}${BLUE}╚══════════════════════════════════════╝${NC}"
+    print_hr "$PDIM"
+    printf "  %sPlatform%s  $(uname -m) / $(uname -s)   %s│%s  Samba (optional) · built-in scheduler · FUSE\n" \
+        "$PTEAL" "$PRST" "$PDIM" "$PRST"
+    print_hr "$PDIM"
     echo ""
-    echo "  GoStream + GoStorm — Unified BitTorrent + FUSE Streaming Engine"
-    echo "  Target:         $(uname -m) / $(uname -s), 24/7 production"
-    echo "  Includes:       Samba (optional), built-in scheduler"
-    echo ""
+
+    local hint="  Press Enter to begin installation  "
+    local hpad=$(( (cols - ${#hint}) / 2 ))
+    [ "$hpad" -lt 0 ] && hpad=0
+    printf "%*s%s%s%s\n\n" "$hpad" "" "$PSUB" "$hint" "$PRST"
+    read -r
 }
 
 # ==============================================================================
@@ -223,7 +414,7 @@ check_prerequisites() {
 # [1/3] System Paths + User/Group
 # ==============================================================================
 collect_paths() {
-    print_header "[1/3] System Paths"
+    wizard_header "[1/3] System Paths" 1 3
 
     # Default: GoStream subdirectory next to the installer
     local default_install_dir="${SCRIPT_DIR}/GoStream"
@@ -245,25 +436,33 @@ collect_paths() {
     # Derive BASE_DIR as INSTALL_DIR
     BASE_DIR="${INSTALL_DIR}"
 
+    # Centered confirmation summary
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
     echo ""
-    print_info "Install directory    : ${INSTALL_DIR}"
-    print_info "Physical source path : ${STORAGE_PATH}"
-    print_info "FUSE mount path      : ${FUSE_MOUNT}"
+    printf "%s%s✔  Paths confirmed%s\n" "$sp" "$PGRN" "$PRST"
+    printf "%s%s   Install dir   :%s %s\n" "$sp" "$PDIM" "$PRST" "$INSTALL_DIR"
+    printf "%s%s   Source path   :%s %s\n" "$sp" "$PDIM" "$PRST" "$STORAGE_PATH"
+    printf "%s%s   FUSE mount    :%s %s\n" "$sp" "$PDIM" "$PRST" "$FUSE_MOUNT"
 }
 
 # ==============================================================================
 # [2/3] Samba (optional)
 # ==============================================================================
 collect_options() {
-    print_header "[2/3] Options"
+    wizard_header "[2/3] Options" 2 3
 
     INSTALL_SAMBA=true
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
     if ask_yn "Install and configure Samba?" "y"; then
         INSTALL_SAMBA=true
-        print_ok "Samba will be installed and configured."
+        echo ""
+        printf "%s%s✔  Samba will be installed and configured.%s\n" "$sp" "$PGRN" "$PRST"
     else
         INSTALL_SAMBA=false
-        print_info "Samba skipped. You will need to configure an alternative access method for the FUSE mount."
+        echo ""
+        printf "%s%s→  Samba skipped — configure an alternative access method post-install.%s\n" "$sp" "$PSUB" "$PRST"
     fi
 }
 
@@ -275,10 +474,9 @@ collect_options() {
 # 5a. Generate config.json from config.json.example
 # ------------------------------------------------------------------------------
 generate_config_json() {
+    step_start "Generate config.json"
     local output_path="${INSTALL_DIR}/config.json"
     local example_path="${INSTALL_DIR}/config.json.example"
-
-    print_info "Generating config.json..."
 
     if [ ! -f "$example_path" ]; then
         print_err "config.json.example not found — cannot generate config."
@@ -298,7 +496,7 @@ generate_config_json() {
 # 5a. Clone or use existing repo source
 # ------------------------------------------------------------------------------
 clone_repo() {
-    print_info "Preparing source in ${INSTALL_DIR}..."
+    step_start "Clone / copy source"
 
     # Check if this is already a cloned repo (main.go exists in SCRIPT_DIR)
     if [ -f "${SCRIPT_DIR}/main.go" ]; then
@@ -348,6 +546,7 @@ clone_repo() {
 # 5a2. Deploy config.json.example
 # ------------------------------------------------------------------------------
 deploy_files() {
+    step_start "Deploy config.json.example"
     print_info "Deploying files to ${INSTALL_DIR}..."
 
     # Ensure INSTALL_DIR exists
@@ -372,7 +571,7 @@ deploy_files() {
 # 5b. Create directories
 # ------------------------------------------------------------------------------
 create_directories() {
-    print_info "Creating required directories..."
+    step_start "Create directories"
 
     # Directories inside INSTALL_DIR (user-writable)
     local local_dirs=(
@@ -409,7 +608,7 @@ create_directories() {
 # 5d. Install systemd service files
 # ------------------------------------------------------------------------------
 install_services() {
-    print_info "Installing systemd service files (requires sudo)..."
+    step_start "Install systemd service"
 
     local samba_restart=""
     if [ "$INSTALL_SAMBA" = "true" ]; then
@@ -474,6 +673,7 @@ SERVICE_EOF
 # 5e. Enable services via systemd
 # ------------------------------------------------------------------------------
 enable_services() {
+    step_start "Enable service"
     print_info "Reloading systemd and enabling services..."
 
     sudo systemctl daemon-reload
@@ -570,8 +770,7 @@ ensure_swap() {
 }
 
 compile_binary() {
-    print_info "Compiling GoStream binary (this takes a few minutes on Pi 4)..."
-
+    step_start "Compile binary  (takes a few minutes on Pi 4)"
     ensure_go
     ensure_swap
 
@@ -622,8 +821,48 @@ compile_binary() {
     fi
 
     print_info "Building binary (GOARCH=${GO_ARCH}, -p 2)..."
+
+    # Spinner during go build (runs in background, main shell polls)
+    _spinner_pid=""
+    _spinner() {
+        local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        local msgs=(
+            "Compiling... grab a coffee, you deserve it."
+            "Still going... the Pi is doing its best, okay?"
+            "Linking... almost there. Probably."
+            "Building... this is why they invented coffee breaks."
+        )
+        local i=0 m=0 tick=0
+        while true; do
+            local frame="${frames[$(( i % ${#frames[@]} ))]}"
+            local msg="${msgs[$(( m % ${#msgs[@]} ))]}"
+            printf "\r  %s%s%s  %s%s%s" "$P4" "$frame" "$PRST" "$PSUB" "$msg" "$PRST"
+            sleep 0.1
+            (( i++ )) || true
+            (( tick++ )) || true
+            # rotate message every ~4 seconds (40 ticks)
+            if (( tick % 40 == 0 )); then (( m++ )) || true; fi
+        done
+    }
+    _spinner &
+    _spinner_pid=$!
+
+    local _build_exit=0
     GOTOOLCHAIN=local GOARCH="${GO_ARCH}" CGO_ENABLED=1 GOTMPDIR="${go_tmp}" \
-        "$GO_BIN" build ${pgo_flag} -p 2 ${ldflags:+-ldflags "${ldflags}"} -o "${out_bin}" .
+        "$GO_BIN" build ${pgo_flag} -p 2 ${ldflags:+-ldflags "${ldflags}"} -o "${out_bin}" . \
+        2>/tmp/gostream_build.log || _build_exit=$?
+
+    # Kill spinner and clear the spinner line
+    kill "$_spinner_pid" 2>/dev/null; wait "$_spinner_pid" 2>/dev/null || true
+    printf "\r%*s\r" "$(get_cols)" ""   # erase spinner line
+
+    if [ "$_build_exit" -ne 0 ]; then
+        print_err "Build failed. Log:"
+        cat /tmp/gostream_build.log >&2
+        rm -f /tmp/gostream_build.log
+        exit "$_build_exit"
+    fi
+    rm -f /tmp/gostream_build.log
     rm -rf "${go_tmp}"
 
     chmod +x "${out_bin}"
@@ -636,7 +875,7 @@ compile_binary() {
 # 5h. Verify installation (non-fatal — binary may not be deployed yet)
 # ------------------------------------------------------------------------------
 verify_install() {
-    print_info "Verifying installation (checking metrics endpoint)..."
+    step_start "Verify installation"
 
     local url="http://127.0.0.1:9080/metrics"
     if command -v curl >/dev/null 2>&1; then
@@ -644,17 +883,32 @@ verify_install() {
             print_ok "GoStream metrics endpoint is reachable at ${url}"
         else
             print_warn "GoStream is not running yet (metrics endpoint not reachable)."
-            print_warn "This is expected if the binary has not been copied and started."
+            print_warn "This is expected — start with: sudo systemctl start gostream"
         fi
     else
         print_warn "curl not available — skipping endpoint verification."
     fi
+
+    # 100% step bar + brief pause before summary screen
+    local cols; cols=$(get_cols)
+    local bar_w=$(( cols - 16 ))
+    echo ""
+    printf "  %s" "$PGRN"
+    local _i; for ((_i=0; _i<bar_w; _i++)); do printf "▓"; done
+    printf "%s  %s%s9/9  100%%%s\n" "$PRST" "$PGRN" "$BOLD" "$PRST$NC"
+    echo ""
+    local done_hint="  All done! Loading summary...  "
+    local dp=$(( (cols - ${#done_hint}) / 2 ))
+    [ "$dp" -lt 0 ] && dp=0
+    printf "%*s%s%s%s\n" "$dp" "" "$PSUB" "$done_hint" "$PRST"
+    sleep 1
 }
 
 # ------------------------------------------------------------------------------
 # Sudoers entry so gostream.service can restart smbd without a password
 # ------------------------------------------------------------------------------
 setup_sudoers() {
+    step_start "Configure sudoers"
     if [ "$INSTALL_SAMBA" != "true" ]; then
         print_info "Samba not installed — skipping sudoers entry."
         return 0
@@ -682,53 +936,109 @@ setup_sudoers() {
 }
 
 # ==============================================================================
-# Final summary
+# Final summary — clears screen, shows full logo + completion screen
 # ==============================================================================
 show_summary() {
+    local cols; cols=$(get_cols)
+    local msg; msg=$(pick_msg _MSGS_DONE)
+
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    draw_logo
+
     echo ""
-    echo "${BOLD}${GREEN}╔══════════════════════════════════════╗${NC}"
-    echo "${BOLD}${GREEN}║  Installation Complete!              ║${NC}"
-    echo "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
+    print_hr "$PGRN" "═"
+    printf "  %s%s  ✔  Installation Complete!%s\n" "$PGRN" "$BOLD" "$PRST$NC"
+    printf "  %s  %s%s\n" "$PSUB" "$msg" "$PRST"
+    print_hr "$PGRN" "═"
     echo ""
-    echo "  Configuration written to:"
-    echo "    ${BOLD}${INSTALL_DIR}/config.json${NC}"
-    echo ""
-    echo "  Service files installed:"
-    echo "    /etc/systemd/system/gostream.service"
+
+    printf "  %sFiles written:%s\n" "$PTEAL" "$PRST"
+    printf "    %s%s/config.json%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
+    printf "    %s/etc/systemd/system/gostream.service%s\n" "$BOLD" "$NC"
     echo ""
 
     if [ "$INSTALL_SAMBA" = "true" ]; then
-        echo "${BOLD}Samba configuration:${NC}"
-        echo "  Edit /etc/samba/smb.conf and ensure your share has:"
-        echo "    oplocks = no"
-        echo "    aio read size = 1"
-        echo "    deadtime = 15"
-        echo "    vfs objects = fileid"
-        echo "  Then: ${YELLOW}sudo systemctl restart smbd${NC}"
+        printf "  %s⚠  Samba — edit /etc/samba/smb.conf:%s\n" "$PYLW" "$PRST"
+        printf "  %s   oplocks = no  │  aio read size = 1  │  deadtime = 15  │  vfs objects = fileid%s\n" "$PDIM" "$PRST"
+        printf "  %s   Then: sudo systemctl restart smbd%s\n" "$PYLW" "$PRST"
         echo ""
     fi
 
-    echo "${BOLD}Next steps:${NC}"
+    print_hr "$PDIM"
+    printf "  %s%sNext steps%s\n" "$BOLD" "$PTEAL" "$PRST$NC"
+    print_hr "$PDIM"
     echo ""
-    echo "  1. Start the service:"
-    echo "     ${YELLOW}sudo systemctl start gostream${NC}"
+
+    printf "  %s 1 %s  sudo systemctl start gostream\n" "$PBOX$BOLD" "$PRST$NC"
+    printf "  %s 2 %s  sudo systemctl status gostream\n" "$PBOX$BOLD" "$PRST$NC"
+    printf "  %s 3 %s  tail -f %s/logs/gostream.log\n" "$PBOX$BOLD" "$PRST$NC" "$INSTALL_DIR"
     echo ""
-    echo "  2. Check status:"
-    echo "     ${YELLOW}sudo systemctl status gostream${NC}"
-    echo "     ${YELLOW}curl http://127.0.0.1:9080/metrics${NC}"
+
+    # Card background — dark gray (256-color only, transparent on 8-color)
+    local BG=""
+    [ "${_ncolors:-8}" -ge 256 ] && BG=$'\e[48;5;235m'
+
+    local bi=$(( cols - 6 ))   # box inner width
+    local _i
+
+    # ── Control Panel ────────────────────────────────────────────────────────
+    local cp_label="Plex · TMDB · NAT-PMP · Ports · Scheduler · Webhooks"
+    local cp_url="http://<your-ip>:9080/control"
+    local cp_title="  Control Panel  "
+    local cp_title_len=${#cp_title}
+    local cp_label_pad=$(( (bi - ${#cp_label}) / 2 ))
+    local cp_url_pad=$(( (bi - ${#cp_url}) / 2 ))
+
+    printf "\n"
+    # Top border with title embedded
+    printf "  %s%s╔═%s%s%s%s" "$PBOX" "$BOLD" "$cp_title" "$PBOX$BOLD" "" ""
+    for ((_i=cp_title_len+2; _i<bi; _i++)); do printf "═"; done
+    printf "╗%s\n" "$PRST$NC"
+    # Subtitle (features)
+    printf "  %s%s║%s%s%*s%s%s%*s%s%s║%s\n" \
+        "$PBOX$BOLD" "" "$BG$PSUB" \
+        "" "$cp_label_pad" "" "$cp_label" \
+        "" "$cp_label_pad" "$PRST" \
+        "$PBOX$BOLD" "$PRST$NC"
+    # Blank
+    printf "  %s%s║%s%s%*s%s%s║%s\n" \
+        "$PBOX$BOLD" "" "$BG" "" "$bi" "" "$PRST" "$PBOX$BOLD" "$PRST$NC"
+    # URL
+    printf "  %s%s║%s%s%*s%s%s%s%*s%s%s║%s\n" \
+        "$PBOX$BOLD" "" "$BG" \
+        "" "$cp_url_pad" "" "$BOLD$P4" "$cp_url" "$NC" \
+        "" "$cp_url_pad" "$PRST" \
+        "$PBOX$BOLD" "$PRST$NC"
+    # Bottom border
+    printf "  %s%s╚" "$PBOX" "$BOLD"
+    for ((_i=0; _i<bi; _i++)); do printf "═"; done
+    printf "╝%s\n" "$PRST$NC"
+
     echo ""
-    echo "  3. Configure everything from the Control Panel:"
-    echo "     ┌─────────────────────────────────────────────────────────┐"
-    echo "     │  Plex, TMDB, NAT-PMP, ports, scheduler, and more       │"
-    echo "     │  http://<your-ip>:9080/control                          │"
-    echo "     └─────────────────────────────────────────────────────────┘"
-    echo ""
-    echo "  4. Dashboards:"
-    echo "     ${BOLD}http://<your-ip>:9080/control${NC}    (Control Panel + Scheduler)"
-    echo "     ${BOLD}http://<your-ip>:9080/dashboard${NC}  (Health Monitor)"
-    echo ""
-    echo "  5. Logs:"
-    echo "     ${YELLOW}tail -f ${INSTALL_DIR}/logs/gostream.log${NC}"
+
+    # ── Dashboard ────────────────────────────────────────────────────────────
+    local db_url="http://<your-ip>:9080/dashboard"
+    local db_title="  Dashboard  "
+    local db_title_len=${#db_title}
+    local db_url_pad=$(( (bi - ${#db_url}) / 2 ))
+
+    printf "  %s%s╔═%s%s%s" "$PBOX" "$BOLD" "$db_title" "$PBOX$BOLD" ""
+    for ((_i=db_title_len+2; _i<bi; _i++)); do printf "═"; done
+    printf "╗%s\n" "$PRST$NC"
+    # Blank
+    printf "  %s%s║%s%s%*s%s%s║%s\n" \
+        "$PBOX$BOLD" "" "$BG" "" "$bi" "" "$PRST" "$PBOX$BOLD" "$PRST$NC"
+    # URL
+    printf "  %s%s║%s%s%*s%s%s%s%*s%s%s║%s\n" \
+        "$PBOX$BOLD" "" "$BG" \
+        "" "$db_url_pad" "" "$BOLD$P4" "$db_url" "$NC" \
+        "" "$db_url_pad" "$PRST" \
+        "$PBOX$BOLD" "$PRST$NC"
+    # Bottom border
+    printf "  %s%s╚" "$PBOX" "$BOLD"
+    for ((_i=0; _i<bi; _i++)); do printf "═"; done
+    printf "╝%s\n" "$PRST$NC"
+
     echo ""
 }
 
@@ -747,13 +1057,13 @@ main() {
     # Default: Samba enabled (can be overridden by collect_options)
     INSTALL_SAMBA=true
 
-    install_system_deps
-    check_prerequisites
-
     collect_paths
     collect_options
 
-    print_header "[3/3] Installing"
+    install_system_deps
+    check_prerequisites
+
+    wizard_header "[3/3] Installing" 3 3
 
     clone_repo
     echo ""
