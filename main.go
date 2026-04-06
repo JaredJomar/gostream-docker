@@ -17,6 +17,7 @@ import (
 	"gostream/internal/gostorm/web"
 	"gostream/internal/monitor/collector"
 	"gostream/internal/monitor/dashboard"
+	"gostream/internal/opentracker"
 	"gostream/internal/prowlarr"
 	"gostream/internal/syncer/engines"
 	"gostream/internal/syncer/scheduler"
@@ -130,6 +131,10 @@ var inFlightPrefetches sync.Map // key: "path:offset", value: bool
 var activePumps sync.Map        // Map[string]*NativePumpState — one pump per file path
 var pumpTimers sync.Map         // key: path, value: *time.Timer
 var priorityTimers sync.Map     // key: path, value: *time.Timer
+
+// OpenTracker: contatori O(1) per handle aperti (per hash e per path).
+// Permette query rapide da cleanup e priority timer senza scansionare activeHandles.
+var globalOpenTracker = opentracker.New()
 
 // Serializes concurrent pump creation for the same file.
 var pumpCreationMu sync.Mutex
@@ -649,6 +654,16 @@ func (d *VirtualDirNode) Unlink(ctx context.Context, name string) syscall.Errno 
 
 	// Force-close active pump and handles before removing torrent.
 	// Without this, smbd D-states on a file with an active blocking read.
+	// V-OpenTracker: attendi che i Read() in volo completino prima di cancellare
+	// la pump, per evitare nil-deref su nativeReader durante cancel concorrente.
+	if globalOpenTracker.IsPathOpen(fullPath) {
+		for i := 0; i < 3; i++ {
+			if !globalOpenTracker.IsPathOpen(fullPath) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 	if val, ok := activePumps.Load(fullPath); ok {
 		ps := val.(*NativePumpState)
 		if ps.cancel != nil {
@@ -912,6 +927,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		h.nativeReader = ps.reader
 		h.pumpCancel = ps.cancel
 		h.mu.Unlock()
+		globalOpenTracker.Inc(h.hash, h.path)
 		// Primary reconnect (refCount 0→1): inherit player position.
 		// Secondary handles (Plex probes at arbitrary offsets): no inheritance.
 		if newRefs == 1 {
@@ -942,6 +958,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 			h.nativeReader = ps.reader
 			h.pumpCancel = ps.cancel
 			h.mu.Unlock()
+			globalOpenTracker.Inc(h.hash, h.path)
 			if newRefs == 1 {
 				h.isPrimaryHandle = true
 				if curPos := atomic.LoadInt64(&ps.playerOff); curPos > 0 {
@@ -966,6 +983,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 			refCount: 1,
 		}
 		activePumps.Store(h.path, sharedState)
+		globalOpenTracker.Inc(h.hash, h.path)
 		pumpCreationMu.Unlock() // SUCCESS: Shared state registered, global lock released
 
 		logger.Printf("[V264] Native Pump Started (Slot Acquired): %s", filepath.Base(h.path))
@@ -1521,6 +1539,7 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 			h.nativeReader = ps.reader
 			h.pumpCancel = ps.cancel
 			h.mu.Unlock()
+			globalOpenTracker.Inc(h.hash, h.path)
 			logger.Printf("[V258] Handle ATTACHED to existing active pump (Refs: %d): %s", atomic.LoadInt32(&ps.refCount), filepath.Base(h.path))
 		}
 		// Unlock early if attached or not needed
@@ -1545,6 +1564,7 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 								refCount: 1,
 							}
 							activePumps.Store(h.path, sharedState)
+							globalOpenTracker.Inc(h.hash, h.path)
 
 							logger.Printf("[Pump] Upgraded on-the-fly for confirmed playback: %s", filepath.Base(h.path))
 
@@ -1764,6 +1784,7 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 			return 0
 		}
 		newRefs := atomic.AddInt32(&ps.refCount, -1)
+		globalOpenTracker.Dec(h.hash, h.path)
 		logger.Printf("[Pump] Release handle for %s (Remaining Refs: %d)", filepath.Base(h.path), newRefs)
 
 		if newRefs <= 0 {
@@ -1842,18 +1863,9 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 	var t *time.Timer
 	t = time.AfterFunc(retentionDelay, func() {
 		priorityTimers.CompareAndDelete(h.path, t)
-		stillActive := false
-		activeHandles.Range(func(key, value interface{}) bool {
-			activeH := key.(*MkvHandle)
-			if activeH.path == h.path {
-				stillActive = true
-				return false
-			}
-			return true
-		})
 
-		if stillActive {
-			// A new session or handle is active for the same file, do not cleanup.
+		// O(1): controlla se il path ha ancora handle aperti prima di disabilitare priority.
+		if globalOpenTracker.IsPathOpen(h.path) {
 			return
 		}
 
@@ -1862,23 +1874,8 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 			if state.Hash != "" {
 				hHash := metainfo.NewHashFromHex(state.Hash)
 
-				// Check if any other active handle uses the same hash before disabling priority.
-				hashStillInUse := false
-				activeHandles.Range(func(key, value interface{}) bool {
-					activeH := key.(*MkvHandle)
-					// We need to resolve the hash for this active handle to compare
-					// Since we don't store hash in MkvHandle, we check playbackRegistry
-					if regVal, ok := playbackRegistry.Load(activeH.path); ok {
-						regState := regVal.(*PlaybackState)
-						if regState.Hash == state.Hash {
-							hashStillInUse = true
-							return false
-						}
-					}
-					return true
-				})
-
-				if hashStillInUse {
+				// O(1): controlla se altri file dello stesso torrent sono ancora aperti.
+				if globalOpenTracker.IsHashOpen(state.Hash) {
 					// Another file from the same torrent is still open, keep priority.
 					return
 				}
@@ -2845,9 +2842,6 @@ func main() {
 					pct = 100
 				}
 				return pct
-			},
-			OnBadSwarm: func(hash, title string) {
-				log.Printf("[AI-Pilot] SwarmQuality: Triggering alternative search for: %s", title)
 			},
 		}
 		go ai.StartAITuner(context.Background(), provider)
