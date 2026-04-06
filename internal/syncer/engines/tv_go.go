@@ -20,6 +20,7 @@ import (
 	"gostream/internal/catalog"
 	"gostream/internal/catalog/tmdb"
 	"gostream/internal/catalog/torrentio"
+	"gostream/internal/metadb"
 	"gostream/internal/prowlarr"
 )
 
@@ -39,6 +40,7 @@ type TVGoEngine struct {
 
 	registry     map[string]TVEpisodeEntry
 	registryFile string
+	db           *metadb.DB // V1.7.1: Optional SQLite backend
 
 	processedThisRun map[string]bool
 	stats            TVSyncStats
@@ -131,7 +133,7 @@ var (
 var tvExcludedGenreIDs = map[int]bool{99: true, 10763: true, 10764: true, 10767: true, 16: true}
 
 // NewTVGoEngine creates a new Go TV sync engine.
-func NewTVGoEngine(cfg TVEngineConfig) *TVGoEngine {
+func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 	var prowlarrClient *prowlarr.Client
 	if cfg.ProwlarrCfg.Enabled {
 		prowlarrClient = prowlarr.NewClient(cfg.ProwlarrCfg)
@@ -157,6 +159,7 @@ func NewTVGoEngine(cfg TVEngineConfig) *TVGoEngine {
 		limiter:          rate.NewLimiter(rate.Every(500*time.Millisecond), 1),
 		logger:           logger,
 		registryFile:     regFile,
+		db:               db,
 		processedThisRun: make(map[string]bool),
 		blacklistFile:    blFile,
 	}
@@ -255,6 +258,25 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 }
 
 func (e *TVGoEngine) loadRegistry() map[string]TVEpisodeEntry {
+	if e.db != nil {
+		entries, err := e.db.AllEpisodes()
+		if err != nil {
+			e.logger.Printf("[TVSync] Warning: failed to load registry from DB: %v", err)
+		} else {
+			reg := make(map[string]TVEpisodeEntry)
+			for _, entry := range entries {
+				reg[entry.EpisodeKey] = TVEpisodeEntry{
+					QualityScore: entry.QualityScore,
+					Hash:         entry.Hash,
+					FilePath:     entry.FilePath,
+					Source:       entry.Source,
+					Created:      entry.Created,
+				}
+			}
+			e.logger.Printf("[TVSync] Loaded %d episodes from StateDB", len(reg))
+			return reg
+		}
+	}
 	data, err := os.ReadFile(e.registryFile)
 	if err != nil {
 		return make(map[string]TVEpisodeEntry)
@@ -376,14 +398,28 @@ func (e *TVGoEngine) episodeKey(show string, season, episode int) string {
 }
 
 func (e *TVGoEngine) registerEpisode(key string, score int, hash, path, source string) {
+	created := time.Now().Unix()
 	e.registry[key] = TVEpisodeEntry{
 		QualityScore: score,
 		Hash:         hash,
 		FilePath:     path,
 		Source:       source,
-		Created:      time.Now().Unix(),
+		Created:      created,
 	}
-	e.saveRegistry()
+	if e.db != nil {
+		if err := e.db.UpsertEpisode(key, metadb.EpisodeEntry{
+			EpisodeKey:   key,
+			QualityScore: score,
+			Hash:         hash,
+			FilePath:     path,
+			Source:       source,
+			Created:      created,
+		}); err != nil {
+			e.logger.Printf("[TVSync] Warning: failed to save episode to DB: %v", err)
+		}
+	} else {
+		e.saveRegistry()
+	}
 }
 
 func (e *TVGoEngine) discoverShows(ctx context.Context) ([]tmdb.TVShow, error) {

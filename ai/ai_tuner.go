@@ -129,7 +129,11 @@ func (t *AITweak) Sanitize() {
 	}
 }
 
-func crisisActive() bool {
+func crisisActive(buffer int) bool {
+	// Se il buffer è quasi pieno (>95%), non siamo in crisi anche se la velocità è 0
+	if buffer > 95 {
+		return false
+	}
 	return getAverage(torrentSpeedAvg) < 2.0 && len(torrentSpeedAvg) > 8
 }
 
@@ -325,7 +329,13 @@ func runTuningCycle(provider AIProvider) {
 	// AI CYCLE: adaptive — 180s normal, 60s in crisis (avg speed < 1MB/s)
 	cycleCounter++
 	threshold := normalCycle
-	if crisisActive() {
+
+	buffer := 100
+	if provider.GetBufferPct != nil {
+		buffer = provider.GetBufferPct()
+	}
+
+	if crisisActive(buffer) {
 		threshold = crisisCycle
 	}
 	if cycleCounter < threshold {
@@ -358,11 +368,6 @@ func runTuningCycle(provider AIProvider) {
 		} else if diff < -1.0 {
 			speedTrendStr = fmt.Sprintf("DOWN (%.1fMB/s)", diff)
 		}
-	}
-
-	buffer := 100
-	if provider.GetBufferPct != nil {
-		buffer = provider.GetBufferPct()
 	}
 
 	// IDLE GUARD: buffer full + no download → restore defaults for next episode
@@ -404,15 +409,13 @@ func runTuningCycle(provider AIProvider) {
 	// Re-zero peak for next 3m cycle
 	peakCPUCycle = 0
 
-	// Qwen3 ChatML template con Few-Shot Examples (Full Data)
+	// Dynamic Optimizer Prompt for Minimax/Cloud Providers (Fine-tuned for RP4)
 	prompt := fmt.Sprintf(
-		"<|im_start|>system\nBitTorrent Optimizer. Examples:\n"+
-			"- Peers:2, Total:10, Size:2GB, Speed:0, CPU:25 -> {\"connections_limit\":5,\"peer_timeout_seconds\":60}\n"+
-			"- Peers:50, Total:150, Size:40GB, Speed:15, CPU:30 -> {\"connections_limit\":50,\"peer_timeout_seconds\":15}\n"+
-			"- Peers:40, Total:80, Size:15GB, Speed:10, CPU:90 -> {\"connections_limit\":12,\"peer_timeout_seconds\":20}\n"+
-			"Output ONLY JSON. Use 2-digit seconds for timeout.<|im_end|>\n"+
-			"<|im_start|>user\nPeers:%d, Total:%d, Size:%.1fGB, Speed:%.1fMB/s, CPU:%d%%, Buf:%d%%, History:%s, Trend:%s<|im_end|>\n"+
-			"<|im_start|>assistant\n",
+		"BitTorrent Optimizer for Raspberry Pi 4. Default settings: 25 connections, 30s peer timeout. "+
+			"Output ONLY JSON: {\"connections_limit\": int, \"peer_timeout_seconds\": int}. "+
+			"Perform dynamic fine-tuning for BOTH values independently: lower timeout (<30s) to prune dead peers during stalls, higher timeout (>30s) to stabilize slow but steady peers. Adjust connections to balance CPU load (target <60%). If speed is below 3MB/s increase connections. If file size is circa 20GB tune to get 5MB/s or more\n"+
+			"User context:\n"+
+			"Peers:%d, Total:%d, Size:%.1fGB, Speed:%.1fMB/s, CPU:%d%%, Buf:%d%%, History:%s, Trend:%s",
 		activeStats.ActivePeers, activeStats.TotalPeers, fileSizeGB, currSpeedMBs, int(currentCPU), buffer, historyStr, speedTrendStr,
 	)
 

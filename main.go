@@ -3147,6 +3147,7 @@ func main() {
 				StateDir:     GetStateDir(),
 				LogsDir:      logsDir,
 				ProwlarrCfg:  globalConfig.Prowlarr,
+				DB:           stateDB,
 			}),
 			"watchlist": engines.NewWatchlistSyncer(engines.WatchlistSyncerConfig{
 				GoStormURL:      globalConfig.GoStormBaseURL,

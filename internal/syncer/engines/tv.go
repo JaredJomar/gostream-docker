@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"gostream/internal/metadb"
 	"gostream/internal/prowlarr"
 )
 
@@ -26,6 +27,7 @@ type TVSyncerConfig struct {
 	StateDir     string
 	LogsDir      string
 	ProwlarrCfg  prowlarr.ConfigProwlarr
+	DB           *metadb.DB // V1.7.1: Optional SQLite backend
 }
 
 // NewTVSyncer creates a new Go-based TV syncer.
@@ -60,7 +62,7 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 	}
 
 	return &TVSyncer{
-		engine: NewTVGoEngine(engineCfg),
+		engine: NewTVGoEngine(engineCfg, cfg.DB),
 	}
 }
 
