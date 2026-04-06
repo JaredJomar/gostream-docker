@@ -986,8 +986,7 @@ show_summary() {
     local bi=$(( cols - 6 ))   # box inner width (chars between ║ and ║)
     local _i
 
-    # Draw top border with title embedded in it
-    # Total inner = 1(═) + title_len + rest(═) = bi  ✓
+    # Draw top border with title embedded: 1(═) + title_len + rest(═) = bi ✓
     _btop() {
         local t="$1" tl=${#1}
         local rest=$(( bi - tl - 1 ))
@@ -997,8 +996,7 @@ show_summary() {
         printf "╗%s\n" "$PRST$NC"
     }
 
-    # Draw a centered text line inside the box
-    # Total inner = lpad + text_len + rpad = bi  ✓
+    # Draw a centered text line inside the box: lpad + text_len + rpad = bi ✓
     _bline() {
         local t="$1" fc="${2:-$PRST}"
         local tl=${#t}

@@ -41,10 +41,6 @@ var defaultTimeout = 0
 var metricsHistory []string
 var CurrentLimit int32
 
-// Swarm eval tracking
-var swarmEvalDone = make(map[string]bool)
-var swarmEvalStart = make(map[string]time.Time)
-
 // Rolling buffers (180s window, 36 samples every 5s)
 var torrentSpeedAvg []float64
 var cpuUsageAvg []float64
@@ -57,12 +53,11 @@ const crisisCycle = 12 // 60s
 
 // AIProvider holds configuration for LLM backends
 type AIProvider struct {
-	URL          string                   // Base URL (local: http://127.0.0.1:8085, openrouter: https://openrouter.ai/api/v1)
-	APIKey       string                   // API key for cloud providers (empty for local)
-	Model        string                   // Model ID for cloud providers (empty for local)
-	IsLocal      bool                     // true = llama.cpp, false = cloud API
-	GetBufferPct func() int               // Returns FUSE buffer fill percentage (0-100)
-	OnBadSwarm   func(hash, title string) // Called when AI predicts buffering risk
+	URL          string     // Base URL (local: http://127.0.0.1:8085, openrouter: https://openrouter.ai/api/v1)
+	APIKey       string     // API key for cloud providers (empty for local)
+	Model        string     // Model ID for cloud providers (empty for local)
+	IsLocal      bool       // true = llama.cpp, false = cloud API
+	GetBufferPct func() int // Returns FUSE buffer fill percentage (0-100)
 }
 
 // Keep-Alive client for llama.cpp local
@@ -226,9 +221,6 @@ func runTuningCycle(provider AIProvider) {
 		wasIdle = true
 		atomic.StoreInt32(&CurrentLimit, 0) // fall back to globalConfig.MasterConcurrencyLimit
 		lastActiveHash = ""
-		// Clean up swarm eval state
-		swarmEvalDone = make(map[string]bool)
-		swarmEvalStart = make(map[string]time.Time)
 		return
 	}
 
@@ -309,10 +301,6 @@ func runTuningCycle(provider AIProvider) {
 		}
 		atomic.StoreInt32(&CurrentLimit, int32(defaultConns))
 		go resetLlamaCache(provider)
-
-		// Reset swarm eval for new torrent
-		delete(swarmEvalDone, currentHash)
-		swarmEvalStart[currentHash] = time.Now()
 	}
 	lastActiveHash = currentHash
 
@@ -332,18 +320,6 @@ func runTuningCycle(provider AIProvider) {
 	cpuUsageAvg = append(cpuUsageAvg, currentCPU)
 	if len(cpuUsageAvg) > 36 {
 		cpuUsageAvg = cpuUsageAvg[1:]
-	}
-
-	// SWARM QUALITY EVAL: Run once ~60s after torrent opens
-	if !swarmEvalDone[currentHash] {
-		if startTime, ok := swarmEvalStart[currentHash]; ok && time.Since(startTime) >= 60*time.Second {
-			swarmEvalDone[currentHash] = true
-			go func() {
-				fullStats := activeT.Stat()
-				age := int(time.Since(startTime).Seconds())
-				EvaluateSwarmQuality(provider, activeT, fullStats, age)
-			}()
-		}
 	}
 
 	// AI CYCLE: adaptive — 180s normal, 60s in crisis (avg speed < 1MB/s)
