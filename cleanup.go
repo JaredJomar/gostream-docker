@@ -196,6 +196,12 @@ func (cm *CleanupManager) runCleanup() {
 			}
 		}
 
+		// Protezione streaming: i file attualmente in lettura non devono perdere
+		// la loro inode entry anche se WalkDir non li vede (es. rescan Plex concorrente).
+		for _, openPath := range globalOpenTracker.OpenPaths() {
+			validFiles[openPath] = true
+		}
+
 		// Prune ghost entries. Safety: skip if validFiles is empty (mount failure).
 		if len(validFiles) > 0 {
 			pruned := globalInodeMap.PruneMissing(validFiles)

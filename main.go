@@ -8,13 +8,21 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/cespare/xxhash/v2"
 	"gostream/ai"
 	server "gostream/internal/gostorm"
 	"gostream/internal/gostorm/settings"
 	torrstor "gostream/internal/gostorm/torr/storage/torrstor"
 	tsutils "gostream/internal/gostorm/utils"
 	"gostream/internal/gostorm/web"
-	"github.com/cespare/xxhash/v2"
+	"gostream/internal/metadb"
+	"gostream/internal/monitor/collector"
+	"gostream/internal/monitor/dashboard"
+	"gostream/internal/opentracker"
+	"gostream/internal/prowlarr"
+	"gostream/internal/syncer/engines"
+	"gostream/internal/syncer/scheduler"
+	"gostream/internal/updater"
 	"io"
 	"log"
 	"net"
@@ -44,35 +52,28 @@ import (
 
 var logger = log.New(os.Stdout, "[GoProxy] ", log.LstdFlags)
 
-// V79: httpClient now created in main() after config loading to use globalConfig values
 var httpClient *http.Client
 
-// V226: Unified Master Semaphore for all data operations (Native, HTTP, Prefetch)
-// Provides strict protection for GoStorm internal connections (limit: 25)
+// masterDataSemaphore limits concurrent data operations (Native, HTTP, Prefetch).
 var masterDataSemaphore chan struct{}
 
 var startTime = time.Now()
-var metaCache *LRUCache           // Replaced sync.Map with LRU cache (FASE 3.1)
-var raCache = newReadAheadCache() // V238: Sharded Cache (Audit 2.A)
+var metaCache *LRUCache
+var raCache = newReadAheadCache()
 
-// Global rate limiter and lock manager (FASE 1 - Stabilità Critica)
-// V82: Initialized in main() from globalConfig
 var globalRateLimiter *RateLimiter
 var globalLockManager *LockManager
 
 // Global peer-based preloader (FASE 2 - Performance)
-// V79: Now initialized in main() after httpClient creation
 var peerPreloader *PeerPreloader
-var nativeBridge *NativeClient // V160: Native Bridge
+var nativeBridge *NativeClient
 
-// Global cleanup manager (FASE 3.3 - Memory Cleanup)
 var globalCleanupManager *CleanupManager
-
-// Global torrent remover (FASE 4.2 - Auto-Remove Torrents)
 var globalTorrentRemover *TorrentRemover
-
-// Global configuration (FASE 4.16 - Env Configuration)
 var globalConfig Config
+
+// Global Prowlarr client for indexer queries (nil when disabled).
+var prowlarrClient *prowlarr.Client
 
 // GetEffectiveConcurrencyLimit returns AI limit if set, otherwise globalConfig default
 func GetEffectiveConcurrencyLimit() int {
@@ -87,12 +88,12 @@ func GetEffectiveConcurrencyLimit() int {
 type PlaybackState struct {
 	mu          sync.RWMutex
 	Path        string
-	Hash        string // V185: Store InfoHash to link with GoStorm priority
-	ImdbID      string // V281: IMDB ID from MKV line 4 — used for webhook matching
+	Hash        string // InfoHash for GoStorm priority management
+	ImdbID      string // IMDB ID from MKV line 4, used for webhook matching
 	OpenedAt    time.Time
-	ConfirmedAt time.Time // Quando arriva il webhook di Plex
-	IsHealthy   bool      // Conferma definitiva da Plex
-	IsStopped   bool      // V272: Explicit media.stop received
+	ConfirmedAt time.Time // Set when Plex webhook arrives
+	IsHealthy   bool      // Confirmed by Plex
+	IsStopped   bool      // Set on explicit media.stop webhook
 }
 
 func (ps *PlaybackState) SetHealthy(healthy bool) {
@@ -113,47 +114,45 @@ var playbackRegistry sync.Map // path -> *PlaybackState
 // Global sync cache manager (FASE 4.13 - Sync Script Caches)
 var globalSyncCacheManager *SyncCacheManager
 
-// V138: Global paths for physical source and virtual mount
+// StateDB is the optional SQLite backend for persistent state.
+var stateDB *metadb.DB
+
 var physicalSourcePath string
 var virtualMountPath string
 
-// V138: Global stop channel for background goroutines
 var backgroundStopChan = make(chan struct{})
-var backgroundStopOnce sync.Once // V227: Prevent double-close panic
+var backgroundStopOnce sync.Once
 
-// V83: Global buffer pool for Read operations (eliminates ~1000 alloc/min)
-// V143-Fix: Initialized in main() to match Config.ReadAheadBase (dynamic sizing)
+// readBufferPool size matches Config.ReadAheadBase (set in main).
 var readBufferPool *sync.Pool
 
-// V281: Regex to extract IMDB ID from Plex webhook raw payload.
-// Matches "imdb://tt1234567" inside the Guid array (capital G) without touching
-// the lowercase "guid" string field — avoids json UnmarshalTypeError.
+// reImdbID matches "imdb://tt1234567" in the Guid array of Plex webhook payloads.
 var reImdbID = regexp.MustCompile(`"imdb://(tt\d+)"`)
 var reEmptyNumber = regexp.MustCompile(`"(\w+)":\s*,`)
 
-// V226: Track active handles for Idle Reader Cleanup (Unified)
-var activeHandles sync.Map // key: *MkvHandle, value: bool
-
-// V227: Deduplicate prefetch goroutines
+var activeHandles sync.Map      // key: *MkvHandle, value: bool
 var inFlightPrefetches sync.Map // key: "path:offset", value: bool
+var activePumps sync.Map        // Map[string]*NativePumpState — one pump per file path
+var pumpTimers sync.Map         // key: path, value: *time.Timer
+var priorityTimers sync.Map     // key: path, value: *time.Timer
 
-// V258: Global Pump Registry - One pump per file path
-var activePumps sync.Map // Map[string]*NativePumpState
+// OpenTracker: contatori O(1) per handle aperti (per hash e per path).
+// Permette query rapide da cleanup e priority timer senza scansionare activeHandles.
+var globalOpenTracker = opentracker.New()
 
-// V259: Global Mutex for pump creation synchronization
+// Serializes concurrent pump creation for the same file.
 var pumpCreationMu sync.Mutex
 
-// V258: NativePumpState tracks a shared pump across multiple handles
+// NativePumpState tracks a shared pump across multiple handles for the same file.
 type NativePumpState struct {
 	cancel    context.CancelFunc
 	reader    *NativeReader
 	path      string
-	refCount  int32 // V260: Track how many handles are using this pump
-	playerOff int64 // V702: Last known player read position, saved on handle release
+	refCount  int32
+	playerOff int64 // last known player position, saved on handle release
 }
 
-// V226: Helper to create NativeReader via NativeBridge (Zero-Network Data Path)
-// resolveTargetFile finds the torrent hash and file index for a given URL and size
+// resolveTargetFile finds the torrent hash and file index for a given URL and size.
 func resolveTargetFile(url string, targetSize int64, physicalPath string) (string, int, error) {
 	if nativeBridge == nil {
 		return "", 0, fmt.Errorf("nativeBridge is nil")
@@ -167,23 +166,19 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 		hashStr := url[start : start+end]
 		hash := metainfo.NewHashFromHex(hashStr)
 
-		// V1.4.0-Optimization: Removed 500ms retry loop. Wake() will handle registration.
 		t := web.BTS.GetTorrent(hash)
 
 		if t != nil {
-			// V215: Auto-Priority Disabled. Only Webhook can grant it now.
-			// t.IsPriority = true (Removed)
 
 			files := t.Files()
 			sort.Slice(files, func(i, j int) bool {
 				return tsutils.CompareStrings(files[i].Path(), files[j].Path())
 			})
 
-			// V208: Size Match Candidates
 			var sizeMatchIndex int
 			var matchesBySize int
 
-			// V206/V207: Smart Matching - Normalize names and strip hash
+			// Normalize names for matching: strip hash suffixes and separators.
 			cleanPhys := strings.ToLower(filepath.Base(physicalPath))
 			if len(hashStr) >= 8 {
 				// Strip full hash
@@ -212,14 +207,13 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 				}
 			}
 
-			// V208: Fallback - If only one file matches the exact size, trust it.
-			// This handles cases where Plex renaming makes name matching impossible.
+			// Single size match: trust it even when name normalization fails (e.g. Plex renames).
 			if matchesBySize == 1 {
 				return hashStr, sizeMatchIndex, nil
 			}
 		}
 
-		// Fallback (V1.4.0): Extract index from URL if torrent not in RAM or match failed.
+		// Fallback: extract index from URL if torrent not in RAM or name match failed.
 		// Wake() will perform full discovery later.
 		urlFileIdx := 0
 		if strings.Contains(url, "index=") {
@@ -237,18 +231,8 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 	return "", 0, fmt.Errorf("file not found in torrent")
 }
 
-// V86-Gold: Fast deterministic Inode generation from filename
-// Uses FNV-1a hash to avoid syscalls in Readdir (eliminates "stat storm")
-// FNV-1a is extremely fast (non-crypto) and provides excellent distribution
-//
-// V86-Gold CRITICAL BUG FIX:
-// V85 regression: Used e.Type() directly which returns Go's internal bits
-//   - os.ModeDir = 0x80000000 (Go internal representation)
-//   - FUSE/Samba/Kernel expect POSIX bits: syscall.S_IFDIR = 0x4000
-//
-// V86 fix: Use IsDir() + explicit POSIX mode bits (syscall.S_IFDIR/S_IFREG)
-//   - IsDir() is still cached from ReadDir (no syscall)
-//   - POSIX bits ensure proper FUSE/Samba/Linux kernel compatibility
+// Fast deterministic inode from FNV-1a hash to avoid syscalls in Readdir.
+// Uses POSIX bits (syscall.S_IFDIR/S_IFREG) for FUSE/Samba/kernel compatibility.
 func hashFilenameToInode(name string) uint64 {
 	return xxhash.Sum64String(name)
 }
@@ -259,7 +243,7 @@ type Metadata struct {
 	Mtime             time.Time
 }
 
-// V79-Profiling: Detailed timing metrics for Read operations
+// ReadTiming collects per-read latency metrics for profiling.
 type ReadTiming struct {
 	StartTime          time.Time
 	MetadataLookupTime time.Duration
@@ -334,8 +318,7 @@ func sanitizeTime(t time.Time) uint64 {
 	return uint64(t.Unix())
 }
 
-// fillAttrFromStat populates FUSE attributes from a standard syscall.Stat_t
-// V138-POSIX: Centralized but preserving all critical fields for Samba/throughput
+// fillAttrFromStat populates FUSE attributes from a standard syscall.Stat_t.
 func fillAttrFromStat(st *syscall.Stat_t, out *fuse.Attr) {
 	out.Ino = st.Ino
 	out.Nlink = uint32(st.Nlink)
@@ -348,17 +331,14 @@ func fillAttrFromStat(st *syscall.Stat_t, out *fuse.Attr) {
 	out.Blocks = uint64(st.Blocks)                   // CRITICAL: Samba uses for throughput calc
 	out.Size = uint64(st.Size)
 
-	// Sanitizzazione dei timestamp (V138-POSIX)
-	// V196: Using time.Now() as cross-platform baseline for virtualized FUSE attributes
-	// prevents build errors between Mac (Darwin) and Raspberry Pi (Linux)
+	// Use time.Now() as cross-platform baseline for virtualized FUSE attributes.
 	now := time.Now()
 	out.Mtime = sanitizeTime(now)
 	out.Atime = sanitizeTime(now)
 	out.Ctime = sanitizeTime(now)
 }
 
-// fillAttrFromMetadata populates FUSE attributes from our internal Metadata
-// V138-POSIX: Ensures standard fields are populated even for virtual files
+// fillAttrFromMetadata populates FUSE attributes from our internal Metadata.
 func fillAttrFromMetadata(m *Metadata, out *fuse.Attr) {
 	out.Size = uint64(m.Size)
 	out.Mode = syscall.S_IFREG | 0644
@@ -368,7 +348,6 @@ func fillAttrFromMetadata(m *Metadata, out *fuse.Attr) {
 	out.Blksize = uint32(globalConfig.FuseBlockSize) // Configurable block size (default 1MB)
 	out.Blocks = (uint64(m.Size) + 511) / 512        // Estimate blocks based on size
 
-	// Sanitizzazione dei timestamp (V138-POSIX)
 	ts := sanitizeTime(m.Mtime)
 	out.Mtime = ts
 	out.Atime = ts
@@ -395,10 +374,9 @@ func (r *VirtualMkvRoot) Getattr(ctx context.Context, f fs.FileHandle, out *fuse
 		return ToErrno(err)
 	}
 
-	// Use centralized helper for attributes (V138-POSIX)
 	fillAttrFromStat(&st, &out.Attr)
 
-	// V134 Fix: Override Ino con la costante Root (fondamentale per Plex)
+	// Root inode must be constant (required by Plex).
 	out.Ino = InodeRoot
 	out.Mode = syscall.S_IFDIR | 0755
 	out.Size = 4096
@@ -409,25 +387,7 @@ func (r *VirtualMkvRoot) Getattr(ctx context.Context, f fs.FileHandle, out *fuse
 func (r *VirtualMkvRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	fullPath := filepath.Join(r.sourcePath, name)
 
-	// V138-Gold: Optimized Lookup - use memory metadata when possible
 	if strings.HasSuffix(name, ".mkv") {
-		// V138-Gold: Protect backend from request storms
-		// V145-Priority: BYPASS limiter if this is an active, healthy stream
-		// V170-DeadlockFix: Removed Priority logic as RateLimiter is bypassed
-		// isPriority := false
-		// if val, ok := playbackRegistry.Load(fullPath); ok {
-		// 	if ps, ok := val.(*PlaybackState); ok && ps.GetStatus() {
-		// 		isPriority = true
-		// 	}
-		// }
-
-		// V170-DeadlockFix: Removed RateLimiter from Lookup to prevent FUSE freeze
-		// if !isPriority {
-		// 	if err := globalRateLimiter.Acquire(ctx); err != nil {
-		// 		return nil, syscall.EAGAIN
-		// 	}
-		// }
-
 		meta, err := getOrReadMeta(fullPath)
 		if err == nil {
 			addFileToInodeMap(fullPath, meta.URL)
@@ -503,7 +463,6 @@ func (s *nfsDirStream) Seekdir(ctx context.Context, off uint64) syscall.Errno {
 func (s *nfsDirStream) Close() {}
 
 func (r *VirtualMkvRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	// V140: Check cache first
 	if entries, found := globalDirCache.Get(r.sourcePath); found {
 		return &nfsDirStream{entries: entries}, 0
 	}
@@ -534,7 +493,6 @@ func (r *VirtualMkvRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Err
 		})
 	}
 
-	// V140: Update cache
 	globalDirCache.Put(r.sourcePath, result)
 
 	return &nfsDirStream{entries: result}, 0
@@ -556,7 +514,6 @@ func (r *VirtualMkvRoot) Statfs(ctx context.Context, out *fuse.StatfsOut) syscal
 	out.Bavail = 125 * 1024 * 1024 // Available to non-root users
 
 	// File counts: based on actual cache size
-	// FASE 3.1: Use LRU cache Len() instead of Range()
 	totalFiles := uint64(metaCache.Len())
 	if totalFiles == 0 {
 		totalFiles = 1000 // Fallback estimate if cache not populated
@@ -583,10 +540,9 @@ type VirtualDirNode struct {
 var _ fs.NodeReaddirer = (*VirtualDirNode)(nil)
 var _ fs.NodeLookuper = (*VirtualDirNode)(nil)
 var _ fs.NodeGetattrer = (*VirtualDirNode)(nil)
-var _ fs.NodeUnlinker = (*VirtualDirNode)(nil) // FASE 4.2: Auto-remove support
+var _ fs.NodeUnlinker = (*VirtualDirNode)(nil)
 
 func (d *VirtualDirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	// V140: Check cache first
 	if entries, found := globalDirCache.Get(d.physicalPath); found {
 		return &nfsDirStream{entries: entries}, 0
 	}
@@ -619,7 +575,6 @@ func (d *VirtualDirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Err
 		}
 	}
 
-	// V140: Update cache
 	globalDirCache.Put(d.physicalPath, result)
 
 	return &nfsDirStream{entries: result}, 0
@@ -628,26 +583,7 @@ func (d *VirtualDirNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Err
 func (d *VirtualDirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	fullPath := filepath.Join(d.physicalPath, name)
 
-	// V138-Gold: Optimized Lookup - use memory metadata when possible
 	if strings.HasSuffix(name, ".mkv") {
-		// V138-Gold: Protect backend from request storms
-		// V145-Priority: BYPASS limiter if this is an active, healthy stream
-		// V170-DeadlockFix: Removed Priority logic as RateLimiter is bypassed
-		// isPriority := false
-		// // Note: d.Lookup fullPath construction matches storage key
-		// if val, ok := playbackRegistry.Load(fullPath); ok {
-		// 	if ps, ok := val.(*PlaybackState); ok && ps.GetStatus() {
-		// 		isPriority = true
-		// 	}
-		// }
-
-		// V170-DeadlockFix: Removed RateLimiter from Lookup to prevent FUSE freeze
-		// if !isPriority {
-		// 	if err := globalRateLimiter.Acquire(ctx); err != nil {
-		// 		return nil, syscall.EAGAIN
-		// 	}
-		// }
-
 		meta, err := getOrReadMeta(fullPath)
 		if err == nil {
 			addFileToInodeMap(fullPath, meta.URL)
@@ -690,19 +626,15 @@ func (d *VirtualDirNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 
 // Getattr returns directory attributes
 func (d *VirtualDirNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	// V86-Gold: Removed hot path logging
-
-	// Critical fix for Samba: Copy ALL metadata from physical directory
 	st := syscall.Stat_t{}
 	if err := syscall.Stat(d.physicalPath, &st); err != nil {
 		logger.Printf("GETATTR DIR ERROR: %v", err)
 		return ToErrno(err)
 	}
 
-	// Use centralized helper for attributes (V138-POSIX)
 	fillAttrFromStat(&st, &out.Attr)
 
-	// V134-fix: Override Ino con hash del path completo per evitare collisioni (Season.01)
+	// Use full-path hash to avoid inode collisions (e.g. Season.01 dirs).
 	out.Ino = getDirInodeFromMap(d.physicalPath)
 
 	// Override ONLY Mode and Size to ensure directory permissions and Samba compliance
@@ -724,9 +656,18 @@ func (d *VirtualDirNode) Unlink(ctx context.Context, name string) syscall.Errno 
 
 	fullPath := filepath.Join(d.physicalPath, name)
 
-	// V271: Force-close active pump and handles BEFORE removing torrent.
-	// Without this, smbd D-states when trying to delete a file with an active
-	// read (e.g., torrent with no seeders blocks FUSE read indefinitely).
+	// Force-close active pump and handles before removing torrent.
+	// Without this, smbd D-states on a file with an active blocking read.
+	// V-OpenTracker: attendi che i Read() in volo completino prima di cancellare
+	// la pump, per evitare nil-deref su nativeReader durante cancel concorrente.
+	if globalOpenTracker.IsPathOpen(fullPath) {
+		for i := 0; i < 3; i++ {
+			if !globalOpenTracker.IsPathOpen(fullPath) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 	if val, ok := activePumps.Load(fullPath); ok {
 		ps := val.(*NativePumpState)
 		if ps.cancel != nil {
@@ -765,10 +706,7 @@ func (d *VirtualDirNode) Unlink(ctx context.Context, name string) syscall.Errno 
 		return ToErrno(err)
 	}
 
-	// V1.4.6-Fix: Remove from Python episode registry in real-time
 	RemoveFromRegistry(fullPath)
-
-	// V140: Invalidate directory cache
 	globalDirCache.Delete(d.physicalPath)
 
 	logger.Printf("UNLINK COMPLETE: file deleted successfully")
@@ -786,32 +724,11 @@ var _ fs.NodeGetattrer = (*VirtualMkvNode)(nil)
 var _ fs.NodeOpener = (*VirtualMkvNode)(nil)
 
 func (n *VirtualMkvNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	// V138-Gold: Protect backend from request storms during heavy navigation
-	// V145-Priority: BYPASS limiter if this is an active, healthy stream
-	// V170-DeadlockFix: Removed Priority logic as RateLimiter is bypassed
-	// isPriority := false
-	// if val, ok := playbackRegistry.Load(n.vMeta.Path); ok {
-	// 	if ps, ok := val.(*PlaybackState); ok && ps.GetStatus() {
-	// 		isPriority = true
-	// 	}
-	// }
-
-	// V170-DeadlockFix: Removed RateLimiter from Getattr to prevent FUSE freeze
-	// if !isPriority {
-	// 	if err := globalRateLimiter.Acquire(ctx); err != nil {
-	// 		return syscall.EAGAIN
-	// 	}
-	// }
-
-	// V138-Gold: RAM-ONLY metadata to prevent NFS timeouts
 	fillAttrFromMetadata(n.vMeta, &out.Attr)
 	out.Ino = getFileInodeFromMap(n.vMeta.Path)
 	return 0
 }
 
-// V246: Proactive Context Switch on File Open
-// When the OS attempts to open an MKV, we signal the cache to switch context immediately.
-// This increments the SessionID, invalidating all old data BEFORE the first Read() happens.
 func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if globalConfig.LogLevel == "DEBUG" {
 		logger.Printf("=== OPEN VIRTUAL === path=%s", n.vMeta.Path)
@@ -820,31 +737,31 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	// PROACTIVE CLEANUP TRIGGER (V246): must be sync before any Read() can arrive.
 	raCache.SwitchContext(n.vMeta.Path)
 
-	// V185: Extract Hash for Priority management
-	hashStr, urlFileIdx := ExtractHashAndIndex(n.vMeta.URL)
-
-	// V265: hasWarmup — async Wake for instant Open only if BOTH head and tail are ready.
-	hasWarmup := false
-	if diskWarmup != nil && hashStr != "" {
-		headReady := diskWarmup.GetAvailableRange(hashStr, urlFileIdx) > 0
-		tailReady := diskWarmup.GetTailRange(hashStr, urlFileIdx) > 0
-		if headReady && tailReady {
-			hasWarmup = true
-		}
+	// Cancel any pending release timers (Debounce)
+	if oldTimer, ok := pumpTimers.LoadAndDelete(n.vMeta.Path); ok {
+		oldTimer.(*time.Timer).Stop()
+	}
+	if oldTimer, ok := priorityTimers.LoadAndDelete(n.vMeta.Path); ok {
+		oldTimer.(*time.Timer).Stop()
 	}
 
-	// V237-Fix: Robust Synchronous Native Wake in Open phase.
+	hashStr, urlFileIdx := ExtractHashAndIndex(n.vMeta.URL)
+
+	// hasFullWarmup: Open returns instantly only if both head and tail warmup files are ready.
+	// headReady: Allows async Wake and direct ID injection for instant start.
+	headReady := false
+	if diskWarmup != nil && hashStr != "" {
+		headReady = diskWarmup.GetAvailableRange(hashStr, urlFileIdx) > 0
+	}
+
 	magnetCandidate := n.vMeta.URL
 	if hashStr != "" && (strings.HasPrefix(n.vMeta.URL, "http://") || strings.HasPrefix(n.vMeta.URL, "https://")) {
 		magnetCandidate = "magnet:?xt=urn:btih:" + hashStr
 	}
 
-	// V265: Dual-state Wake (Async with Warmup / Sync without).
-	// Gillian: async Wake when both head+tail warmup are ready — Open() returns instantly,
-	// disk warmup serves initial reads while torrent activates in background.
-	// Sync Wake when no warmup — blocks until torrent is ready before first Read().
+	// Async Wake when head warmup is ready (Open returns instantly); sync Wake otherwise.
 	if nativeBridge != nil && magnetCandidate != "" {
-		if hasWarmup {
+		if headReady {
 			safeGo(func() {
 				_ = nativeBridge.Wake(magnetCandidate, urlFileIdx)
 			})
@@ -853,7 +770,6 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		}
 	}
 
-	// V148-Fix: Track both movies and TV shows for priority
 	if val, exists := playbackRegistry.Load(n.vMeta.Path); !exists {
 		playbackRegistry.Store(n.vMeta.Path, &PlaybackState{
 			Path:     n.vMeta.Path,
@@ -862,15 +778,13 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 			OpenedAt: time.Now(),
 		})
 	} else {
-		// V216-Enhancement: Silent Re-Open Priority Restoration
 		if val != nil {
 			state := val.(*PlaybackState)
 			state.mu.Lock()
 			state.OpenedAt = time.Now()
-			state.IsStopped = false // V272: Reset stop flag on re-open
+			state.IsStopped = false
 
-			// V1.4.0-Fix: Only restore priority if there was a RECENT webhook confirmation (<30m).
-			// This prevents stale Healthy flags from metadata scans causing zombie torrents.
+			// Restore priority only if webhook confirmed recently (<30m) to avoid zombie torrents.
 			recentlyConfirmed := !state.ConfirmedAt.IsZero() && time.Since(state.ConfirmedAt) < 30*time.Minute
 			isHealthy := state.IsHealthy
 			state.mu.Unlock()
@@ -889,15 +803,12 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 
 	now := time.Now()
 
-	// V690: Direct ID Injection — skip resolveTargetFile for warmup HIT path.
-	// Warmup data was written with (hashStr, urlFileIdx) as the key, so they are
-	// guaranteed to be correct. Saves 20-500ms per open (5×100ms retry loop).
-	// V272 (sync Wake fallback) is no longer needed — hasWarmup path bypasses resolution entirely.
+	// Use warmup IDs directly when available, skipping the resolveTargetFile retry loop.
 	var finalHash string
 	var fileIdx int
 	var isNative bool
 
-	if hasWarmup && hashStr != "" {
+	if headReady && hashStr != "" {
 		finalHash = hashStr
 		fileIdx = urlFileIdx
 		isNative = true
@@ -918,8 +829,9 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		lastTime:         now,
 		lastOff:          -1,
 		lastActivityTime: now,       // Initialize activity tracking
-		hasWarmup:        hasWarmup, // V272: Scanner-aware retention
+		hasWarmup:        headReady, // Eligibility for fast SSD probes
 	}
+	h.state.Store(stateWarmup) // Initial state; transitions to stateStreaming on seek/resume.
 
 	if isNative {
 		h.hash = finalHash
@@ -931,45 +843,64 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		})
 	}
 
-	// V182: Register for cleanup
 	activeHandles.Store(h, true)
 
 	return h, 0, 0
 }
 
+// handleState values for MkvHandle.state (atomic.Uint32).
+// A handle transitions one-way: stateWarmup → stateStreaming or stateTailProbe.
+const (
+	stateWarmup    uint32 = 0 // Initial: SSD warmup eligible (TTFF phase)
+	stateStreaming uint32 = 1 // Pump-only streaming; no SSD warmup
+	stateTailProbe uint32 = 2 // Plex scan probe: tail region, stateless FetchBlock
+)
+
+func stateName(s uint32) string {
+	switch s {
+	case stateWarmup:
+		return "WARMUP"
+	case stateStreaming:
+		return "STREAMING"
+	case stateTailProbe:
+		return "TAIL_PROBE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 type MkvHandle struct {
 	url, path        string
 	size             int64
-	lastOff          int64 // V226: Atomic tracking for pump sync
+	lastOff          int64
 	lastLen          int
 	lastTime         time.Time
-	lastActivityTime time.Time // FASE 2.3: Idle Grace Reset
-	monitorStarted   bool      // Impedisce monitoraggi duplicati per lo stesso handle
-	lastGlobalUpdate time.Time // Debounce global activity updates
+	lastActivityTime time.Time
+	monitorStarted   bool
+	lastGlobalUpdate time.Time
 
-	// V226: Unified Bridge Reader (Zero-Network)
-	nativeReader *NativeReader
-	hash         string     // V227: Store hash for stateless FetchBlock
-	magnet       string     // V237: Store magnet link for Native Wake
-	fileID       int        // V227: Store fileID for stateless FetchBlock
-	mu           sync.Mutex // V227: Protecting activity and timing fields
-	pumpCancel   context.CancelFunc
-	hasSlot      bool
-	isWatching   bool      // V258: Handle is attached to a shared pump
-	hasWarmup    bool      // V272: True if both head+tail warmup available at Open time
-	pumpOnce        sync.Once // V310: lazy pump start on first real Read()
-	isPrimaryHandle bool      // V703b: true for pump creator and primary reconnects (newRefs==1)
+	nativeReader    *NativeReader
+	hash            string
+	magnet          string
+	fileID          int
+	mu              sync.Mutex
+	pumpCancel      context.CancelFunc
+	hasSlot         bool
+	isWatching      bool
+	hasWarmup       bool          // true if both head+tail warmup available at Open time
+	state           atomic.Uint32 // handleState: stateWarmup | stateStreaming | stateTailProbe
+	pumpOnce        sync.Once
+	isPrimaryHandle bool // true for pump creator and primary reconnects (refCount 0→1)
 }
 
-// V264: startNativePump centralizes the logic for acquiring a slot and starting the background pump.
-// It can be called from Open (proactive) or Read (rescue for late resolution).
+// startNativePump acquires a slot and starts the background pump.
+// Called from Open (proactive) or Read (rescue for late resolution).
 func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 	// 1. Verify we don't already have a slot or an active pump
 	if h.hasSlot {
 		return
 	}
 
-	// V238: Strategic Reserve Logic - Hardened for Pi 4
 	isHealthy := false
 	if val, ok := playbackRegistry.Load(h.path); ok {
 		if ps, ok := val.(*PlaybackState); ok && ps.GetStatus() {
@@ -989,10 +920,8 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		return
 	}
 
-	// V259: Lock pump creation to prevent race condition
 	pumpCreationMu.Lock()
 
-	// V260: Check activePumps first (Singleton pattern)
 	if val, ok := activePumps.Load(h.path); ok {
 		ps := val.(*NativePumpState)
 		newRefs := atomic.AddInt32(&ps.refCount, 1)
@@ -1002,10 +931,9 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		h.nativeReader = ps.reader
 		h.pumpCancel = ps.cancel
 		h.mu.Unlock()
-		// V703b: Primary reconnect (refCount 0→1): inherit player position for V310 anchor
-		// and mark as primary so V284 and V702 can trust its lastOff.
-		// Secondary handles (refCount 1→2+, Plex CIFS metadata probes): no inheritance —
-		// their first Read() at an arbitrary offset must not steer the pump via V284/V286.
+		globalOpenTracker.Inc(h.hash, h.path)
+		// Primary reconnect (refCount 0→1): inherit player position.
+		// Secondary handles (Plex probes at arbitrary offsets): no inheritance.
 		if newRefs == 1 {
 			h.isPrimaryHandle = true
 			if curPos := atomic.LoadInt64(&ps.playerOff); curPos > 0 {
@@ -1017,18 +945,15 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		return
 	}
 
-	// V272: Optimization - Release global mutex before blocking on semaphore
-	// or performing SSD I/O. We use a secondary check inside the semaphore block.
+	// Release mutex before blocking on semaphore to avoid holding it during I/O.
 	pumpCreationMu.Unlock()
 
-	// V226: Unified Concurrency - Try to acquire a persistent slot
 	select {
 	case masterDataSemaphore <- struct{}{}:
-		// Double-check activePumps after acquiring semaphore to prevent race
+		// Double-check activePumps after acquiring semaphore (another goroutine may have created it).
 		pumpCreationMu.Lock()
 		if val, ok := activePumps.Load(h.path); ok {
-			// Someone else created it while we were waiting for the semaphore
-			<-masterDataSemaphore // Release our newly acquired slot
+			<-masterDataSemaphore
 			ps := val.(*NativePumpState)
 			newRefs := atomic.AddInt32(&ps.refCount, 1)
 			h.mu.Lock()
@@ -1037,7 +962,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 			h.nativeReader = ps.reader
 			h.pumpCancel = ps.cancel
 			h.mu.Unlock()
-			// V703b: Same primary/secondary guard as above.
+			globalOpenTracker.Inc(h.hash, h.path)
 			if newRefs == 1 {
 				h.isPrimaryHandle = true
 				if curPos := atomic.LoadInt64(&ps.playerOff); curPos > 0 {
@@ -1062,61 +987,28 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 			refCount: 1,
 		}
 		activePumps.Store(h.path, sharedState)
+		globalOpenTracker.Inc(h.hash, h.path)
 		pumpCreationMu.Unlock() // SUCCESS: Shared state registered, global lock released
 
 		logger.Printf("[V264] Native Pump Started (Slot Acquired): %s", filepath.Base(h.path))
 
-		// Start background pump — resume from last cached position OR end of disk warmup
+		// Start background pump — resume from last cached position
 		resumeOffset := raCache.MaxCachedOffset(h.path)
 
-		// V261: Strategic pump skip — start pump near end of warmup zone.
+		// Start pump near end of warmup zone so it buffers past 64MB before SSD handover.
 		if diskWarmup != nil && h.hash != "" {
 			diskOffset := diskWarmup.GetAvailableRange(h.hash, h.fileID)
-
-			// V262: Header Validation (Performed OUTSIDE global mutex)
-			if diskOffset > 0 {
-				buf := make([]byte, 16)
-				nRead, _ := diskWarmup.ReadAt(h.hash, h.fileID, buf, 0)
-				isHeaderValid := false
-				// V262-Fix: require at least 8 bytes; removed the 0x00/0x00/0x00 catch-all
-				// which is a false positive for sparse/zero-filled warmup files.
-				if nRead >= 8 {
-					if (buf[0] == 0x1A && buf[1] == 0x45 && buf[2] == 0xDF && buf[3] == 0xA3) || // MKV EBML
-						(buf[4] == 'f' && buf[5] == 't' && buf[6] == 'y' && buf[7] == 'p') { // MP4/ISO ftyp
-						isHeaderValid = true
-					}
-				}
-
-				if !isHeaderValid {
-					logger.Printf("[DiskWarmup] INVALID HEADER detected for %s. Resetting cache.", h.hash[:8])
-					diskWarmup.RemoveHash(h.hash)
-					diskOffset = 0
-				}
-			}
-
 			if diskOffset > 16*1024*1024 {
 				safetyMargin := int64(16 * 1024 * 1024)
 				skipOffset := diskOffset - safetyMargin
 				if skipOffset > resumeOffset {
 					resumeOffset = skipOffset
-					logger.Printf("[DiskWarmup] PUMP SKIP: Starting from %.1fMB (Disk: %.1fMB, Margin: 16MB)",
-						float64(resumeOffset)/(1<<20), float64(diskOffset)/(1<<20))
-
-					// V261-Preseed: REMOVED. The FUSE Read handler serves [0, warmupFileSize)
-					// directly from SSD before checking raCache, so preseed entries are never
-					// read by the player. They waste raCache budget (48MB) and cause premature
-					// eviction of the boundary chunk at warmupFileSize → playback freeze.
+					logger.Printf("[DiskWarmup] PUMP SKIP: Starting from %.1fMB to bridge SSD handover", float64(resumeOffset)/(1<<20))
 				}
 			}
 		}
 
-		// V700: Anchor pump to player position if MaxCachedOffset is stale-high.
-		// After a forward jump (V284), MaxCachedOffset stays at the jump destination
-		// (e.g. 1344MB for a 1417MB file). Subsequent pump restarts all start at 1344MB
-		// → immediate EOF → V238/V239 rapid loop. Fix: if resumeOffset is more than
-		// 2 chunks ahead of the player, start the pump at the player's position instead.
-		// V700b: Also handle new handles (lastOff=-1): MaxCachedOffset may be stale from
-		// a previous session (same path re-opened). Player hasn't read yet → start from 0.
+		// Anchor pump to player position when MaxCachedOffset is stale-high to prevent EOF loops.
 		if playerOff := atomic.LoadInt64(&h.lastOff); playerOff > 0 {
 			chunkSize := int64(globalConfig.ReadAheadBase)
 			if chunkSize == 0 {
@@ -1129,15 +1021,20 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 				resumeOffset = aligned
 			}
 		} else if playerOff < 0 && resumeOffset > 0 {
-			logger.Printf("[V700] New handle: reset stale MaxCachedOffset %.1fMB → 0",
-				float64(resumeOffset)/(1<<20))
-			resumeOffset = 0
+			// New handle: reset stale MaxCachedOffset unless warmup is active and covers the range.
+			// If resumeOffset >= warmupFileSize, pump skip cannot fire → dead zone in raCache.
+			warmupCoverage := int64(0)
+			if diskWarmup != nil && h.hash != "" {
+				warmupCoverage = diskWarmup.GetAvailableRange(h.hash, h.fileID)
+			}
+			if warmupCoverage == 0 || resumeOffset >= warmupFileSize {
+				logger.Printf("[V700] New handle: reset stale MaxCachedOffset %.1fMB → 0",
+					float64(resumeOffset)/(1<<20))
+				resumeOffset = 0
+			}
 		}
 
-		// V310: Resume anchor — if the player is significantly ahead of pumpStart
-		// (resume after cache eviction), anchor the pump to the player's position.
-		// This eliminates priority competition in anacrolix between pump (0MB) and
-		// FetchBlock (e.g. 800MB) that causes stuttering on resume.
+		// Anchor pump to player position on resume to eliminate anacrolix priority competition.
 		{
 			chunkSize := int64(globalConfig.ReadAheadBase)
 			if chunkSize == 0 {
@@ -1166,31 +1063,28 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 	}
 }
 
-// V226: nativePump reads continuously from the Native pipe and fills raCache.
-// FUSE Read() never touches the NativeReader directly — it reads from raCache.
-// BUG-4: sharedState is passed so the defer can guard against orphan-delete.
+// nativePump reads continuously from the Native pipe and fills raCache.
+// sharedState guards against orphan-delete in defer.
 func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedState *NativePumpState) {
-	// V260: Capture reader at pump start — Release() cannot nil this
 	pumpReader := h.nativeReader
 	if pumpReader == nil {
-		logger.Printf("[V260] Native Pump Error: reader is nil at startup for %s", filepath.Base(h.path))
+		logger.Printf("[Pump] reader is nil at startup for %s", filepath.Base(h.path))
 		return
 	}
 
 	if h.hash == "" {
-		// V260: Try one last time to resolve the hash if it was missing during Open
+		// Late hash resolution for handles where Open() didn't complete it.
 		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
 			h.hash = hash
 			h.fileID = fileID
-			logger.Printf("[V260] Pump late resolution success: %s", h.hash[:8])
+			logger.Printf("[Pump] Late resolution success: %s", h.hash[:8])
 		} else {
-			logger.Printf("[V260] Native Pump Warning: hash is empty for %s, warmup will be disabled", filepath.Base(h.path))
+			logger.Printf("[Pump] Warning: hash empty for %s, warmup disabled", filepath.Base(h.path))
 		}
 	}
 	defer func() {
 		h.mu.Lock()
-		// BUG-4: Only delete if our sharedState is still the registered one.
-		// Without this check, pump A's defer could delete pump B's entry.
+		// Only delete if our sharedState is still the registered one (prevents pump A's defer from deleting pump B).
 		if val, ok := activePumps.Load(h.path); ok && val == sharedState {
 			activePumps.Delete(h.path)
 		}
@@ -1204,13 +1098,11 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 			}
 			h.hasSlot = false
 		}
-		// V260: Close the captured reader
 		pumpReader.Close()
 		h.mu.Unlock()
 		logger.Printf("[V239] Native Pump Goroutine Ended: %s", filepath.Base(h.path))
 	}()
 
-	// V238: Refined chunkSize (16MB) for stability on Pi 4.
 	chunkSize := int64(globalConfig.ReadAheadBase)
 	if chunkSize == 0 {
 		chunkSize = 8 * 1024 * 1024
@@ -1228,11 +1120,8 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 		default:
 		}
 
-		// V239: Release-on-Idle Logic
-		// If the player hasn't requested data, yield the slot based on health status.
-		// V262: Intelligent Timeout - confirmed playback gets 2 hours, background scans get 45s.
-		// V262: Check activity across ALL handles for this path, not just the pump
-		// creator. The pump creator handle may be released while other handles still read.
+		// Release idle slot: confirmed playback gets 2h, background scans get 45s.
+		// Check all handles for this path, not just the pump creator.
 		lastAct := time.Time{}
 		activeHandles.Range(func(key, value interface{}) bool {
 			handle := key.(*MkvHandle)
@@ -1264,9 +1153,7 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 			return
 		}
 
-		// V260: Advanced Player Sync - Find the most advanced player position among primary handles.
-		// V703b: Secondary handles (Plex CIFS metadata probes, isPrimaryHandle=false) read at
-		// arbitrary offsets — including them in the max causes false V284 jumps of 10GB+.
+		// Sync to primary handles only; secondary metadata probes cause false 10GB+ jumps.
 		playerOff := int64(0)
 		activeHandles.Range(func(key, value interface{}) bool {
 			handle := key.(*MkvHandle)
@@ -1279,13 +1166,9 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 			return true
 		})
 
-		// V284: Reactive Jump — if player has seeked more than ReadAheadBudget ahead of the
-		// pump, snap the pump to (playerOff / chunkSize) * chunkSize so anacrolix
-		// prioritises the new pieces exactly where the player is.
+		// Snap pump to player position when seek gap exceeds budget, aligned to chunk boundary.
 		jumpThreshold := int64(globalConfig.ReadAheadBudget)
 		if playerOff > offset+jumpThreshold {
-			// V284-Fix: Align perfectly to the nearest chunk boundary.
-			// Never step back a full chunkSize arbitrarily (Audit finding).
 			jumpTo := (playerOff / chunkSize) * chunkSize
 			if jumpTo < 0 {
 				jumpTo = 0
@@ -1297,10 +1180,9 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 			pumpedBytes = 0 // reset grace period so throttle doesn't fire immediately
 		}
 
-		// V238: Adaptive Throttle Logic with Grace Period (64MB)
+		// Throttle background pump after 64MB grace period.
 		if pumpedBytes > 64*1024*1024 {
 			isHealthy := false
-			// V260: Check health for ANY handle on this path
 			if val, ok := playbackRegistry.Load(h.path); ok {
 				if ps, ok := val.(*PlaybackState); ok && ps.GetStatus() {
 					isHealthy = true
@@ -1313,11 +1195,9 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 			}
 		}
 
-		// V260: Use the captured reader (immune to outside nilling)
 		stop, nextOffset := h.nativePumpChunk(pumpReader, offset, chunkSize, playerOff)
 		if stop {
-			// V288: Don't die if not at EOF — the error might be transient
-			// (interrupted by seek, Stream() reconnect, piece timeout).
+			// Transient errors (seek interrupt, reconnect, piece timeout): retry until genuine EOF.
 			if offset < h.size {
 				time.Sleep(200 * time.Millisecond)
 				continue
@@ -1330,35 +1210,17 @@ func (h *MkvHandle) nativePump(ctx context.Context, startOffset int64, sharedSta
 	}
 }
 
-// nativePumpChunk handles reading a single chunk from the Native pipe and returning the buffer to the pool.
-// V227: Uses defer to ensure buffer return even on panic.
+// nativePumpChunk reads a single chunk from the Native pipe into raCache.
 func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOff int64) (stop bool, nextOffset int64) {
 	// Don't pump beyond file size
 	if offset >= h.size {
 		return true, offset
 	}
 
-	// 2. Throttle: Maintain a proactive buffer of 256MB
-	// V260: Advanced Player Sync for throttle (captured from pump loop)
 	budget := globalConfig.ReadAheadBudget
 	diff := offset - playerOff
 
-	// V260: Emergency Overdrive REMOVED (Ring Buffer Exhaustion Fix).
-	// Previously, we disabled throttling if playerOff < warmupFileSize.
-	// This caused the pump to race ahead, overwrite the raCache ring buffer,
-	// and cause cache misses at the handover point (64MB).
-	//
-	// V303c: When disk warmup is active and player is still reading from SSD,
-	// tighten the hard limit by one chunkSize. This ensures the pump never fills
-	// raCache to exactly budget bytes (which would evict the boundary chunk at
-	// warmupFileSize on the next Put). Without this, the entry at 64MB gets evicted
-	// ~17s before the player arrives there → FetchBlock + re-download → freeze.
-	// Only applies during warmup phase; once player passes warmupFileSize, full budget.
-	effectiveBudget := budget
-	if diskWarmup != nil && playerOff < warmupFileSize {
-		effectiveBudget = budget - chunkSize
-	}
-	if diff > effectiveBudget {
+	if diff > budget {
 		// Hard limit reached: Wait for player to advance.
 		time.Sleep(100 * time.Millisecond)
 		return false, offset
@@ -1373,20 +1235,16 @@ func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOf
 		}
 	}
 
-	// Check if this chunk is already cached in RAM
 	if data := raCache.Get(h.path, offset, offset); data != nil {
-		// V260: Even if in RAM, we might need to write it to Disk Warmup if not there yet
 		if diskWarmup != nil && h.hash != "" && offset <= warmupFileSize {
 			diskWarmup.WriteChunk(h.hash, h.fileID, data, offset)
 		}
 		return false, offset + chunkSize
 	}
 
-	// V303: Skip torrent read for offsets already covered by disk warmup.
-	// Pump jumps to warmupFileSize instantly; player reads warmup from SSD.
-	// No raCache seeding here — SSD serves these offsets directly in FUSE Read().
-	// Seeding would waste raCache budget and cause eviction of the boundary chunk.
-	if diskWarmup != nil && h.hash != "" && offset <= warmupFileSize {
+	// Skip warmup zone during initial play (SSD serves 0-80MB); pump jumps ahead to pre-fill raCache.
+	// Gated on stateWarmup to avoid skip on resume/seek.
+	if diskWarmup != nil && h.hash != "" && h.state.Load() == stateWarmup {
 		warmupCoverage := diskWarmup.GetAvailableRange(h.hash, h.fileID)
 		if warmupCoverage >= offset+chunkSize {
 			return false, offset + chunkSize
@@ -1405,8 +1263,6 @@ func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOf
 	n, err := r.ReadAt((*bufPtr)[:end-offset], offset)
 	if n > 0 {
 		raCache.Put(h.path, offset, offset+int64(n)-1, (*bufPtr)[:n])
-		// V256: Write to disk warmup cache (first 128MB only)
-		// V260: Sequential write via Async Worker
 		if diskWarmup != nil && h.hash != "" && offset <= warmupFileSize {
 			diskWarmup.WriteChunk(h.hash, h.fileID, (*bufPtr)[:n], offset)
 		}
@@ -1419,15 +1275,8 @@ func (h *MkvHandle) nativePumpChunk(r *NativeReader, offset, chunkSize, playerOf
 	return false, offset + int64(n)
 }
 
-// shouldInterruptForSeek returns true if a pump interrupt is warranted for a
-// seek detected between prevOff and off.
-//
-// False cases (no interrupt):
-//   - prevOff <= 0: new or freshly-opened handle — no baseline to compare against
-//   - off == 0: Samba/CIFS always issues a header probe at offset 0 on every file
-//     open; this is NOT a user seek and must never restart the pump
-//   - |off - prevOff| <= budget: normal sequential read or small seek within
-//     the read-ahead window
+// shouldInterruptForSeek returns true for genuine seeks beyond budget.
+// Ignores: new handles (prevOff<=0), Samba header probes (off==0), sequential reads.
 func shouldInterruptForSeek(prevOff, off, budget int64) bool {
 	if prevOff <= 0 || off == 0 {
 		return false
@@ -1436,7 +1285,6 @@ func shouldInterruptForSeek(prevOff, off, budget int64) bool {
 }
 
 // safeGo runs a function in a new goroutine with panic recovery.
-// V227: Prevents background tasks from crashing the entire FUSE server.
 func safeGo(fn func()) {
 	go func() {
 		defer func() {
@@ -1453,7 +1301,6 @@ var _ fs.FileReader = (*MkvHandle)(nil)
 var _ fs.FileReleaser = (*MkvHandle)(nil)
 
 func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	// V79-Profiling: Start timing
 	now := time.Now()
 	timing := &ReadTiming{StartTime: now}
 	defer func() {
@@ -1465,17 +1312,13 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 		return fuse.ReadResultData(nil), 0
 	}
 
-	// V227: Protect activity tracking with mutex
 	h.mu.Lock()
-	// V260: Late Metadata Recovery
-	// If Open failed to resolve the hash (metadata lag), retry now.
+	// Late hash recovery: if Open() failed to resolve (metadata lag), retry now.
 	if h.hash == "" && h.url != "" {
 		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
 			h.hash = hash
 			h.fileID = fileID
 			logger.Printf("[LateResolution] Recovered hash for %s: %s", filepath.Base(h.path), h.hash[:8])
-
-			// V264: Late Pump Rescue (via V310 pumpOnce — ensures single start with correct anchor)
 			go h.pumpOnce.Do(func() {
 				h.startNativePump(h.hash, h.fileID)
 			})
@@ -1486,21 +1329,36 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 	isFirstBlock := (off == 0) || (idleTime > time.Duration(globalConfig.WarmStartIdleSeconds)*time.Second)
 	h.lastActivityTime = now
 
-	// FASE 3.3: Track file activity in cleanup manager (debounced)
 	if now.Sub(h.lastGlobalUpdate) > 1*time.Minute {
 		globalCleanupManager.UpdateActivity(h.path)
 		h.lastGlobalUpdate = now
 	}
 	h.mu.Unlock()
 
-	// V285: Eager lastOff update so pump sees seek target immediately
-	// V570: Only streaming reads steer the pump (SSD reads are handled above)
 	prevOff := atomic.LoadInt64(&h.lastOff)
 	atomic.StoreInt64(&h.lastOff, off)
 
-	// V560: Detect pre-confirmation tail probe to suppress V286 interrupt.
-	// V560-Dynamic: Threshold is 5% of file size, capped between 64MB and 2GB.
-	// This covers "far" metadata probes in large Remux files (e.g. The Long Walk).
+	// Transition WARMUP→STREAMING on resume (first read >= warmupFileSize) or seek (jump > budget).
+	// Checked after SSD path above so initial reads within warmup zone are still served.
+	if h.state.Load() == stateWarmup {
+		isSeek := false
+		if prevOff == -1 {
+			if off >= warmupFileSize {
+				isSeek = true
+			}
+		} else if off != 0 {
+			budget := int64(globalConfig.ReadAheadBudget)
+			if off > prevOff+budget || prevOff > off+budget {
+				isSeek = true
+			}
+		}
+		if isSeek {
+			h.state.Store(stateStreaming)
+			logger.Printf("[Warmup] Seek/Resume detected (off=%dMB): %s→%s.", off/(1024*1024), stateName(stateWarmup), stateName(stateStreaming))
+		}
+	}
+
+	// Detect pre-confirmation tail probe (5% of file, 64MB–2GB) to suppress pump interrupt.
 	dynamicThreshold := h.size / 20 // 5%
 	if dynamicThreshold < 64*1024*1024 {
 		dynamicThreshold = 64 * 1024 * 1024
@@ -1509,60 +1367,55 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 		dynamicThreshold = 2 * 1024 * 1024 * 1024
 	}
 
-	isTailProbe := false
-	if h.hash != "" && h.size > dynamicThreshold && off >= h.size-dynamicThreshold {
+	// Transition WARMUP→TAIL_PROBE on first tail region read during discovery phase.
+	if h.state.Load() == stateWarmup && h.hash != "" && h.size > dynamicThreshold && off >= h.size-dynamicThreshold {
+		isUnconfirmed := true
 		if val, ok := playbackRegistry.Load(h.path); ok {
 			ps := val.(*PlaybackState)
 			ps.mu.RLock()
-			isTailProbe = ps.ConfirmedAt.IsZero()
+			isUnconfirmed = ps.ConfirmedAt.IsZero()
 			ps.mu.RUnlock()
-		} else {
-			isTailProbe = true // no registry entry = unconfirmed discovery phase
+		}
+		if isUnconfirmed {
+			h.state.Store(stateTailProbe)
 		}
 	}
+	isTailProbe := h.state.Load() == stateTailProbe
 
-	// V286: Seek-Aware Interrupt. If player jumped far, wake up the pump immediately.
-	// V560: Skip for pre-confirmation tail reads — served by SSD, pump must not be interrupted.
-	// V703b: shouldInterruptForSeek guards prevOff<=0 (new/reconnected handles) and off==0
-	// (Samba header probes on every open) — neither should ever restart the pump.
+	// Interrupt pump on genuine seeks; skip for SSD tail reads (pump must stay alive).
 	budget := int64(globalConfig.ReadAheadBudget)
 	if h.nativeReader != nil && !isTailProbe && shouldInterruptForSeek(prevOff, off, budget) {
 		h.nativeReader.Interrupt()
 		torrstor.ResetShield()
-		logger.Printf("[V286] Interrupt pump for seek+shield reset: %dMB → %dMB",
-			prevOff/(1024*1024), off/(1024*1024))
+		h.state.Store(stateStreaming)
+		logger.Printf("[V286] Interrupt pump for seek+shield reset: %dMB → %dMB (%s→%s)",
+			prevOff/(1024*1024), off/(1024*1024), stateName(stateWarmup), stateName(stateStreaming))
 	}
 
-	// V256: Disk warmup cache — serves first 128MB from SSD while torrent activates.
-	// V261: Read directly into dest — no pool buffer, no 2MB over-read.
-	// V304b: Extended to off<=warmupFileSize so the boundary chunk (written by pump in
-	// session 1) is served from SSD in session 2, eliminating the FetchBlock stall.
-	if diskWarmup != nil && h.hash != "" && off <= warmupFileSize {
-		n, _ := diskWarmup.ReadAt(h.hash, h.fileID, dest, off)
-		if n > 0 {
-			timing.UsedCache = true
-			timing.BytesRead = n
-			if off == 0 {
-				logger.Printf("[DiskWarmup] HIT %s off=0 (%dKB)", filepath.Base(h.path), n/1024)
-			}
-			// V570: Restore lastOff for Head Warmup to keep pump in sync during start.
-			atomic.StoreInt64(&h.lastOff, off)
+	// Serve warmup zone from SSD (up to 80MB with boundary chunk); stateWarmup gate skips SSD on resume/seek.
+	if diskWarmup != nil && h.hash != "" && h.state.Load() == stateWarmup {
+		warmupCoverage := diskWarmup.GetAvailableRange(h.hash, h.fileID)
+		if off < warmupCoverage {
+			n, _ := diskWarmup.ReadAt(h.hash, h.fileID, dest, off)
+			if n > 0 {
+				timing.UsedCache = true
+				timing.BytesRead = n
+				if off == 0 {
+					logger.Printf("[DiskWarmup] HIT %s off=0 (%dKB)", filepath.Base(h.path), n/1024)
+				}
+				atomic.StoreInt64(&h.lastOff, off)
 
-			h.mu.Lock()
-			h.lastLen = n
-			h.lastTime = now
-			h.mu.Unlock()
-			return fuse.ReadResultData(dest[:n]), 0
+				h.mu.Lock()
+				h.lastLen = n
+				h.lastTime = now
+				h.mu.Unlock()
+				return fuse.ReadResultData(dest[:n]), 0
+			}
 		}
 	}
 
-	// V265: Tail warmup — serve last 16MB from SSD for MKV Cues/seek index.
-	// V560: Discovery-Only Tail Warmup. isTailProbe=true means off is in tail area AND
-	// ConfirmedAt.IsZero(). Post-confirmation tail reads fall through to the pump for fresh data.
+	// Serve tail from SSD only during discovery (pre-confirmation); post-confirmation uses pump.
 	if isTailProbe && diskWarmup != nil {
-		// V560-Fix: Tail reads must NOT steer the pump. Restore lastOff to prevOff so
-		// V284 doesn't jump the pump to the cold end-of-file on the next tick.
-		atomic.StoreInt64(&h.lastOff, prevOff)
 		n, _ := diskWarmup.ReadTail(h.hash, h.fileID, dest, off, h.size)
 		if n > 0 {
 			timing.UsedCache = true
@@ -1573,11 +1426,9 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 			return fuse.ReadResultData(dest[:n]), 0
 		}
 
-		// V560-Optimization: If SSD tail miss during probe, use stateless FetchBlock
-		// to keep the head pump alive. Discovery is non-critical, safety first.
+		// On SSD tail miss, use stateless FetchBlock to preserve head pump.
 		nFetch, err := nativeBridge.FetchBlock(h.hash, h.fileID, off, dest)
 		if err == nil && nFetch > 0 {
-			// V1.4.0-Fix: Save captured tail data to SSD for next time
 			if diskWarmup != nil {
 				diskWarmup.WriteTail(h.hash, h.fileID, dest[:nFetch], off, h.size)
 			}
@@ -1592,19 +1443,15 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 	}
 	end := off + int64(len(dest)) - 1
 
-	// V79-Profiling: Check cache hit
 	cacheStart := time.Now()
 	if n := raCache.CopyTo(h.path, off, end, dest); n > 0 {
 		timing.CacheHitTime = time.Since(cacheStart)
 		timing.UsedCache = true
 		timing.BytesRead = n
 
-		// V257: Sync player position even on cache hit to prevent pump stall
 		atomic.StoreInt64(&h.lastOff, off)
 
-		// V227-Fix: Predictive prefetch on raCache hit path.
-		// V257-Optimization: Intelligent Prefetch (Rescue Mode)
-		// Simplified in V295: Removed expensive MaxCachedOffset O(N) scan.
+		// Predictive prefetch: fetch next chunk if pump is absent or near boundary.
 		chunkSize := int64(globalConfig.ReadAheadBase)
 		nextChunkStart := (off/chunkSize + 1) * chunkSize
 
@@ -1629,7 +1476,6 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 						return
 					}
 
-					// Zero-Network Native Prefetch (V227 Phase 7)
 					if goHash != "" {
 						bufPtr := readBufferPool.Get().(*[]byte)
 						defer readBufferPool.Put(bufPtr)
@@ -1669,13 +1515,8 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 	if isStreaming {
 		raSize := int64(globalConfig.ReadAheadBase)
 
-		// FASE 2.3: If idle reset, use initial read-ahead
 		if isFirstBlock {
 			raSize = int64(globalConfig.ReadAheadInitial)
-		} else {
-			// FASE 2.2: Read-Ahead Boost REMOVED (V86-Gold)
-			// Reason: Boosting to 28MB bypassed the 8MB buffer pool, causing massive GC pressure.
-			// We stick to the standard ReadAheadBase (8MB) which fits perfectly in the pool.
 		}
 
 		fetchEnd = off + raSize - 1
@@ -1689,13 +1530,10 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 	h.mu.Unlock()
 	atomic.StoreInt64(&h.lastOff, off)
 
-	// V226: Master Semaphore Management
-	// If the handle already has a persistent slot (Native WATCHING), we don't need to acquire another one.
 	if !h.hasSlot {
-		// V259: Lock pump creation to prevent race condition during startup
 		pumpCreationMu.Lock()
 
-		// V258: Check for existing active pump for this path (Singleton pattern)
+		// Attach to existing pump if one is already running for this path.
 		if val, ok := activePumps.Load(h.path); ok {
 			ps := val.(*NativePumpState)
 			atomic.AddInt32(&ps.refCount, 1) // Increment reference count
@@ -1705,14 +1543,14 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 			h.nativeReader = ps.reader
 			h.pumpCancel = ps.cancel
 			h.mu.Unlock()
+			globalOpenTracker.Inc(h.hash, h.path)
 			logger.Printf("[V258] Handle ATTACHED to existing active pump (Refs: %d): %s", atomic.LoadInt32(&ps.refCount), filepath.Base(h.path))
 		}
 		// Unlock early if attached or not needed
 		if h.hasSlot {
 			pumpCreationMu.Unlock()
 		} else {
-			// Proceed to try upgrade under lock
-			// V238: On-the-fly Pump Upgrade (if not already attached)
+			// On-the-fly pump upgrade for confirmed playback with available slot.
 			if isStreaming && h.hash != "" {
 				if val, ok := playbackRegistry.Load(h.path); ok {
 					if ps, ok := val.(*PlaybackState); ok && ps.GetStatus() {
@@ -1723,22 +1561,21 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 							pumpCtx, pumpCancel := context.WithCancel(context.Background())
 							h.pumpCancel = pumpCancel
 
-							// V258: Register this pump in the global registry IMMEDIATELY
 							sharedState := &NativePumpState{
 								cancel:   pumpCancel,
 								reader:   h.nativeReader,
 								path:     h.path,
-								refCount: 1, // Start with 1
+								refCount: 1,
 							}
 							activePumps.Store(h.path, sharedState)
+							globalOpenTracker.Inc(h.hash, h.path)
 
-							logger.Printf("[V238] Native Pump UPGRADED on-the-fly for confirmed playback: %s", filepath.Base(h.path))
+							logger.Printf("[Pump] Upgraded on-the-fly for confirmed playback: %s", filepath.Base(h.path))
 
-							// V238: Unlock FULL Aggressive Mode on upgrade
 							hHash := metainfo.NewHashFromHex(h.hash)
 							if t := web.BTS.GetTorrent(hHash); t != nil {
 								t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
-								logger.Printf("[V238] FULL Aggressive Mode enabled on-the-fly for: %s", h.hash[:8])
+								logger.Printf("[Pump] Aggressive mode enabled on-the-fly for: %s", h.hash[:8])
 							}
 
 							upgradedState := sharedState
@@ -1761,21 +1598,15 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 				defer func() { <-masterDataSemaphore }()
 			case <-fuseCtx.Done():
 				return nil, syscall.EINTR
-			case <-time.After(30 * time.Second): // V238: Increased to 30s for scan resilience
+			case <-time.After(30 * time.Second):
 				logger.Printf("[MasterSemaphore] Timeout waiting for slot: %s", filepath.Base(h.path))
 				return nil, syscall.ETIMEDOUT
 			}
 		}
 	}
 
-	// FASE 4.11: Streaming Priority - Skip rate limiting for streaming requests
-	// Python version behavior: streaming bypasses rate limiter, only metadata uses it
-	// This ensures active playback has priority over background Plex scanning
-	// FASE 4.11: Streaming Priority - Skip rate limiting for streaming requests
-	// Python version behavior: streaming bypasses rate limiter, only metadata uses it
-	// This ensures active playback has priority over background Plex scanning
+	// Rate limiting for non-streaming (metadata) requests only; streaming bypasses to preserve playback priority.
 	if !isStreaming {
-		// Rate limiting ONLY for non-streaming (metadata) requests (FASE 1.2)
 		rateLimitCtx, rateLimitCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer rateLimitCancel()
 		if err := globalRateLimiter.Acquire(rateLimitCtx); err != nil {
@@ -1784,9 +1615,6 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 		}
 	}
 
-	// V226: Data Path Selection
-	// V257: Unified Architecture - We prefer cache hits from the reactive pump.
-	// But we MUST NOT block or return EAGAIN if data is missing, as it kills the player.
 	if n := raCache.CopyTo(h.path, off, end, dest); n > 0 {
 		atomic.StoreInt64(&h.lastOff, off)
 		h.mu.Lock()
@@ -1812,8 +1640,6 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 
 		buf = (*bufPtr)[:limit]
 
-		// V283: 3 retries × 8s timeout (FetchBlock) = 27s max FUSE block.
-		// Previously 6 × 30s = 180s → smbd D-state for 3 minutes on seek to uncached positions.
 		for attempt := 0; attempt < 3; attempt++ {
 			nFetch, err := nativeBridge.FetchBlock(h.hash, h.fileID, off, buf)
 			if err == nil && nFetch > 0 {
@@ -1836,23 +1662,16 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 
 DATA_READY:
 
-	// V79-Profiling: Record bytes read
 	timing.BytesRead = target
 
-	// V86-Gold: Removed hot path logging (causes 30-50% CPU overhead at 100Mbps)
-	// Metrics still recorded in globalProfilingStats for /metrics endpoint
-
 	if n > 0 {
-		// V257: Cache the data (raCache.Put handles its own copy)
 		raCache.Put(h.path, off, off+int64(n)-1, buf[:n])
 
-		// V265: Seed warmup from Read path (both head and tail)
 		if diskWarmup != nil && h.hash != "" {
 			if off <= warmupFileSize {
 				diskWarmup.WriteChunk(h.hash, h.fileID, buf[:n], off)
 			} else if h.size > tailWarmupSize && off >= h.size-tailWarmupSize {
-				// V610: Frozen Tail — only update SSD tail cache before playback is confirmed.
-				// This preserves the clean discovery-phase metadata snapshot.
+				// Freeze tail SSD cache after playback confirmation to preserve discovery snapshot.
 				isConfirmed := false
 				if val, ok := playbackRegistry.Load(h.path); ok {
 					ps := val.(*PlaybackState)
@@ -1872,25 +1691,12 @@ DATA_READY:
 		h.lastLen = target
 		h.mu.Unlock()
 
-		// FASE 3.3: Track file offset in cleanup manager
 		globalCleanupManager.UpdateOffset(h.path, off, target)
 
-		// V257: SAFE COPY LOGIC
-		// Copy data to FUSE provided 'dest' buffer before returning.
 		nCopy := copy(dest, buf[:n])
 
-		// V143-Performance: Predictive Next Chunk Prefetch
-		// ... (logic follows after copy)
-
-		// If we are reading the last 25% of the current chunk, trigger a fetch for the next chunk
-		// This bridges the "synchronous gap" between chunks on high-latency connections
-		// V257-Optimization: Intelligent Prefetch (Rescue Mode)
-		// We prefetch if:
-		// 1. Pump is NOT active (!h.hasSlot) OR
-		// 2. Pump IS active but Lagging (MaxCachedOffset < nextChunkStart)
+		// Prefetch next chunk if in last 25% of current chunk and pump is absent or lagging.
 		chunkSize := int64(globalConfig.ReadAheadBase)
-		// Check if we are in the last 25% boundary of what looks like a chunk
-		// We approximate "current chunk end" using (off / chunkSize + 1) * chunkSize
 		currentChunkIndex := off / chunkSize
 		nextChunkStart := (currentChunkIndex + 1) * chunkSize
 		distanceToNext := nextChunkStart - off
@@ -1900,12 +1706,8 @@ DATA_READY:
 
 		if isStreaming && (!h.hasSlot || isLagging) {
 			if distanceToNext < chunkSize/4 {
-				// ... (prefetch logic remains the same)
-				// V227: Deduplicate prefetch to prevent goroutine storm
 				prefetchKey := fmt.Sprintf("%s:%d", h.path, nextChunkStart)
 				if _, loaded := inFlightPrefetches.LoadOrStore(prefetchKey, true); !loaded {
-					// Run in background to not block current read delivery
-					// V227: Capture variables explicitly for safety
 					goStart, goSize, goKey, goHash, goFileID := nextChunkStart, int64(globalConfig.ReadAheadBase), prefetchKey, h.hash, h.fileID
 					safeGo(func() {
 						defer inFlightPrefetches.Delete(goKey)
@@ -1915,7 +1717,6 @@ DATA_READY:
 							return // Already cached
 						}
 
-										// BUG-3: prefetch outlives the FUSE call â use independent context
 						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 						defer cancel()
 						if err := globalRateLimiter.Acquire(ctx); err != nil {
@@ -1963,9 +1764,6 @@ DATA_READY:
 		return fuse.ReadResultData(dest[:nCopy]), 0
 	}
 
-	// V238: Protection against slice bounds out of range panic
-	// If buf is smaller than target (e.g. metadata request with small buffer pool),
-	// we must adjust target to avoid a crash.
 	if target > len(buf) {
 		target = len(buf)
 	}
@@ -1977,40 +1775,51 @@ DATA_READY:
 func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 	logger.Printf("=== RELEASE VIRTUAL === path=%s", h.path)
 
-	// V260: Shared Pump Reference Counting
 	if val, ok := activePumps.Load(h.path); ok {
 		ps := val.(*NativePumpState)
-		// V702/V703b: Only primary handles persist their position into ps.playerOff.
-		// Secondary handles (Plex CIFS probes, isPrimaryHandle=false) read at arbitrary
-		// offsets — saving their lastOff would give the next primary reconnect a stale
-		// position from a metadata probe rather than the actual player position.
+		// Only primary handles persist position; secondary probes have arbitrary offsets.
 		if h.isPrimaryHandle {
 			if pos := atomic.LoadInt64(&h.lastOff); pos > 0 {
 				atomic.StoreInt64(&ps.playerOff, pos)
 			}
 		}
-		// V703: Only decrement refCount if this handle actually incremented it.
-		// Handles that didn't acquire a pump slot (h.hasSlot=false, e.g. probe/header
-		// reads) must not decrement — otherwise refCount goes negative and triggers
-		// spurious grace period timers.
+		// Only decrement if this handle acquired a slot; probe/header reads must not decrement.
 		if !h.hasSlot {
 			return 0
 		}
 		newRefs := atomic.AddInt32(&ps.refCount, -1)
-		logger.Printf("[V260] Release handle for %s (Remaining Refs: %d)", filepath.Base(h.path), newRefs)
+		globalOpenTracker.Dec(h.hash, h.path)
+		logger.Printf("[Pump] Release handle for %s (Remaining Refs: %d)", filepath.Base(h.path), newRefs)
 
 		if newRefs <= 0 {
-			// V420: Grace Period — allows Plex to close/reopen handles during CIFS
-			// reconnect without killing the background pump.
-			// V307: Extend to 90s for webhook-confirmed playback (Plex CIFS reconnects
-			// can take >30s, killing the pump and wiping buffer lead → micro-stutter).
+			// V306: If playback is healthy (webhook media.play confirmed), skip grace period.
+			// The pump stays alive until media.stop webhook sets IsHealthy=false and kills it.
+			// This survives long pauses, buffering gaps, and Apple TV re-reads without
+			// killing the pump and causing freeze on resume.
+			if pbVal, ok := playbackRegistry.Load(h.path); ok {
+				if pbState := pbVal.(*PlaybackState); pbState.IsHealthy {
+					logger.Printf("[V306] Healthy playback — pump stays alive (no grace period) for %s", filepath.Base(h.path))
+					// Stop any pending grace timer from a previous release cycle
+					if oldTimer, ok := pumpTimers.LoadAndDelete(h.path); ok {
+						oldTimer.(*time.Timer).Stop()
+					}
+					goto skipGrace
+				}
+			}
+
+			// Grace period: 30s for unconfirmed probes/scans.
 			graceDuration := 30 * time.Second
 			if pbVal, ok := playbackRegistry.Load(h.path); ok {
 				if pbState := pbVal.(*PlaybackState); !pbState.ConfirmedAt.IsZero() {
 					graceDuration = 90 * time.Second
 				}
 			}
-			time.AfterFunc(graceDuration, func() {
+			if oldTimer, ok := pumpTimers.LoadAndDelete(h.path); ok {
+				oldTimer.(*time.Timer).Stop()
+			}
+			var t *time.Timer
+			t = time.AfterFunc(graceDuration, func() {
+				pumpTimers.CompareAndDelete(h.path, t)
 				if val, ok := activePumps.Load(h.path); ok {
 					psNow := val.(*NativePumpState)
 					if atomic.LoadInt32(&psNow.refCount) <= 0 {
@@ -2022,17 +1831,19 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 					}
 				}
 			})
+			pumpTimers.Store(h.path, t)
 			logger.Printf("[V420] Last handle closed: Shared Pump entering %s grace period for %s", graceDuration, filepath.Base(h.path))
 		}
+
+	skipGrace:
 	}
 
-	// V260: Only nil local reference. Pump owns reader lifecycle via captured copy.
+	// Nil local reference only; pump goroutine owns the reader lifecycle via captured copy.
 	h.nativeReader = nil
 
-	// V182: Remove from active handles
 	activeHandles.Delete(h)
 
-	// V272: Fast-drop only for scanner/probe reads that were never confirmed by webhook
+	// Fast-drop (5s) for scanner probes never confirmed by webhook; 30s otherwise.
 	retentionDelay := 30 * time.Second
 	lastOffset := atomic.LoadInt64(&h.lastOff)
 	isProbeOnly := lastOffset < 2*1024*1024 // < 2MB = probe/scanner, not real playback
@@ -2050,58 +1861,34 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 		}
 	}
 
-	// V140: Use AfterFunc to avoid spawning a goroutine stack
-	time.AfterFunc(retentionDelay, func() {
-		// V211: Double-check if any handle for this path is STILL active (e.g. Seek or new session)
-		stillActive := false
-		activeHandles.Range(func(key, value interface{}) bool {
-			activeH := key.(*MkvHandle)
-			if activeH.path == h.path {
-				stillActive = true
-				return false
-			}
-			return true
-		})
+	if oldTimer, ok := priorityTimers.LoadAndDelete(h.path); ok {
+		oldTimer.(*time.Timer).Stop()
+	}
+	var t *time.Timer
+	t = time.AfterFunc(retentionDelay, func() {
+		priorityTimers.CompareAndDelete(h.path, t)
 
-		if stillActive {
-			// A new session or handle is active for the same file, do not cleanup.
+		// O(1): controlla se il path ha ancora handle aperti prima di disabilitare priority.
+		if globalOpenTracker.IsPathOpen(h.path) {
 			return
 		}
 
-		// V201-Fix: Zombie Priority Cleanup
-		// Before deleting the registry entry, ensure Priority is disabled in the Core
 		if val, ok := playbackRegistry.Load(h.path); ok {
 			state := val.(*PlaybackState)
 			if state.Hash != "" {
 				hHash := metainfo.NewHashFromHex(state.Hash)
 
-				// V215: Hash-Aware Safe Release
-				// Check if ANY other active handle is using the same hash before disabling priority
-				hashStillInUse := false
-				activeHandles.Range(func(key, value interface{}) bool {
-					activeH := key.(*MkvHandle)
-					// We need to resolve the hash for this active handle to compare
-					// Since we don't store hash in MkvHandle, we check playbackRegistry
-					if regVal, ok := playbackRegistry.Load(activeH.path); ok {
-						regState := regVal.(*PlaybackState)
-						if regState.Hash == state.Hash {
-							hashStillInUse = true
-							return false
-						}
-					}
-					return true
-				})
-
-				if hashStillInUse {
+				// O(1): controlla se altri file dello stesso torrent sono ancora aperti.
+				if globalOpenTracker.IsHashOpen(state.Hash) {
 					// Another file from the same torrent is still open, keep priority.
 					return
 				}
 
 				if t := web.BTS.GetTorrent(hHash); t != nil {
 					t.IsPriority = false
-					t.SetAggressiveMode(false, 0) // V217: Back to normal download priority
+					t.SetAggressiveMode(false, 0)
 
-					// V272: Scanner fast-drop — only for probe/scanner reads never confirmed by webhook
+					// Fast-drop scanner handles never confirmed by webhook.
 					scannerDrop := false
 					if h.hasWarmup && isProbeOnly {
 						state.mu.RLock()
@@ -2122,11 +1909,11 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 				}
 			}
 		}
-		// V216-Fix: Do NOT delete from registry here.
-		// We leave the entry (without priority) to allow fast resume (via Webhook) to re-enable it.
-		// Cleanup is handled by GlobalCleanupManager (15 min timeout).
+		// Registry entry kept (without priority) for fast webhook-triggered resume.
+		// Cleanup handled by GlobalCleanupManager (15 min timeout).
 		// playbackRegistry.Delete(h.path)
 	})
+	priorityTimers.Store(h.path, t)
 
 	return 0
 }
@@ -2181,23 +1968,22 @@ func getOrReadMeta(path string) (*Metadata, error) {
 type RaBuffer struct {
 	start, end     int64
 	data           []byte
-	lastAccess     int64 // V244: Atomic timestamp (UnixNano)
-	sessionID      int64 // V246: Session ID for Proactive Cleanup
-	responsiveOnly bool  // V304: true if written in responsive mode (not SHA1-verified)
+	lastAccess     int64
+	sessionID      int64
+	responsiveOnly bool // true if written in non-verified mode (responsive shield active)
 }
 
-// V238: Sharded ReadAheadCache
+// ReadAheadCache is a 32-shard LRU cache with session-aware eviction.
 type ReadAheadCache struct {
 	shards    [32]*raShard
 	shardMask uint64
 	used      int64
-	pool      chan []byte // V294: Private pool for recycling 16MB chunks
+	pool      chan []byte // recycled 16MB chunks
 
-	// V246: Proactive Context Switching
 	muContext        sync.Mutex
 	activePath       string
 	currentSessionID int64
-	isEvicting       int32 // V247: Atomic flag to prevent concurrent global evictions
+	isEvicting       int32 // atomic flag prevents concurrent global evictions
 }
 
 type raShard struct {
@@ -2224,7 +2010,6 @@ func (c *ReadAheadCache) getShard(path string) *raShard {
 	return c.shards[xxhash.Sum64String(path)&c.shardMask]
 }
 
-// V294: recycle returns a buffer to the pool if it matches standard chunk size.
 func (c *ReadAheadCache) recycle(b []byte) {
 	chunkSize := int(16 * 1024 * 1024)
 	if globalConfig.ReadAheadBase > 0 {
@@ -2263,9 +2048,7 @@ func raChunkKey(path string, offset int64) string {
 	return fmt.Sprintf("%s:%d", path, offset/chunkSize)
 }
 
-// V246: Proactive Context Switching
-// Called when a NEW stream starts (e.g. at ServeHTTP/Open).
-// If path differs from active, it increments SessionID to invalidate old data.
+// SwitchContext increments SessionID on path change to invalidate stale data.
 func (c *ReadAheadCache) SwitchContext(newPath string) {
 	c.muContext.Lock()
 	pathChanged := newPath != c.activePath
@@ -2278,8 +2061,6 @@ func (c *ReadAheadCache) SwitchContext(newPath string) {
 	activeSessionID := c.currentSessionID
 	c.muContext.Unlock()
 
-	// V270: Trigger global eviction on context switch to free stale data immediately.
-	// Without this, 200MB+ of old stream data persists in shards → new stream stutters.
 	if pathChanged {
 		safeGo(func() {
 			c.triggerGlobalEviction(activePath, activeSessionID)
@@ -2293,20 +2074,15 @@ func (c *ReadAheadCache) Get(p string, off, end int64) []byte {
 	defer s.mu.RUnlock()
 	key := raChunkKey(p, off)
 	if b, ok := s.buffers[key]; ok && off >= b.start && off <= b.end {
-		// V244-Fix: Update activity timestamp atomically (Lock-Free)
 		atomic.StoreInt64(&b.lastAccess, time.Now().UnixNano())
 		if end <= b.end {
-			// Fast path: entirely within one chunk.
-			// V274-Fix: Defensive copy — channel-based pool evicts buffers immediately,
-			// returning a sub-slice reference causes use-after-free if eviction races the caller.
+			// Defensive copy: pool evicts buffers immediately; sub-slice reference causes use-after-free.
 			src := b.data[off-b.start : end-b.start+1]
 			out := make([]byte, len(src))
 			copy(out, src)
 			return out
 		}
-		// V247c-Fix: Cross-boundary read — 'end' falls in the next chunk.
-		// Previously this caused a spurious cache miss and a blocking FetchBlock call
-		// every time a FUSE read straddled a 16MB chunk boundary.
+		// Cross-boundary read: stitch two adjacent chunks to avoid FetchBlock on chunk boundary straddles.
 		if b2, ok2 := s.buffers[raChunkKey(p, end)]; ok2 && b2.start == b.end+1 && b2.end >= end {
 			atomic.StoreInt64(&b2.lastAccess, time.Now().UnixNano())
 			out := make([]byte, end-off+1)
@@ -2318,7 +2094,7 @@ func (c *ReadAheadCache) Get(p string, off, end int64) []byte {
 	return nil
 }
 
-// V293: Exists checks if a chunk is present in cache without allocating.
+// Exists checks if a chunk is present in cache without allocating.
 func (c *ReadAheadCache) Exists(p string, off int64) bool {
 	s := c.getShard(p)
 	s.mu.RLock()
@@ -2328,8 +2104,7 @@ func (c *ReadAheadCache) Exists(p string, off int64) bool {
 	return found
 }
 
-// V293: CopyTo copies data directly into the provided destination buffer.
-// This eliminates the redundant intermediate 'make' call in the FUSE Read hot path.
+// CopyTo copies data directly into dest, avoiding an intermediate allocation in the FUSE Read hot path.
 func (c *ReadAheadCache) CopyTo(p string, off, end int64, dest []byte) int {
 	s := c.getShard(p)
 	s.mu.RLock()
@@ -2342,7 +2117,7 @@ func (c *ReadAheadCache) CopyTo(p string, off, end int64, dest []byte) int {
 			src := b.data[off-b.start : end-b.start+1]
 			return copy(dest, src)
 		}
-		// V247c-Fix: Cross-boundary read — same logic as Get().
+		// Cross-boundary read: same logic as Get().
 		if b2, ok2 := s.buffers[raChunkKey(p, end)]; ok2 && b2.start == b.end+1 && b2.end >= end {
 			atomic.StoreInt64(&b2.lastAccess, time.Now().UnixNano())
 			n1 := copy(dest, b.data[off-b.start:])
@@ -2354,14 +2129,9 @@ func (c *ReadAheadCache) CopyTo(p string, off, end int64, dest []byte) int {
 }
 
 func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
-	// V246: Get current session ID with robust context check
 	c.muContext.Lock()
 	sessID := c.currentSessionID
-	// V247-Fix: If we are caching for the ACTIVE stream, force the current session ID.
-	// This prevents race conditions where a pump started during Open might use an old ID.
-	// V247b-Fix: Background pumps (stale/lingering after context switch) must use sessID=0
-	// so triggerGlobalEviction can correctly identify and evict them. Without this, a
-	// lingering pump writes chunks tagged with the NEW session ID → eviction preserves them.
+	// Active path uses current session ID; stale pumps use sessID=0 so eviction can identify them.
 	if p != c.activePath {
 		sessID = 0
 	}
@@ -2375,7 +2145,6 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 
 	dataSize := int64(len(d))
 
-	// V294: Try to pull a buffer from the recycle pool
 	var dataCopy []byte
 	select {
 	case buf := <-c.pool:
@@ -2389,8 +2158,6 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 	}
 	copy(dataCopy, d)
 
-	// V244: Strict Global Enforcement
-	// Check if this write would exceed global budget
 	globalLimit := globalConfig.ReadAheadBudget
 	if globalLimit <= 0 {
 		globalLimit = 256 * 1024 * 1024 // Fail-safe default
@@ -2400,11 +2167,8 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 	if old, ok := shard.buffers[key]; ok {
 		shard.total -= int64(len(old.data))
 		atomic.AddInt64(&c.used, -int64(len(old.data)))
-		// V294: Recycle old data
 		c.recycle(old.data)
-		// V247d-Fix: Promote to MRU end of order on overwrite (true LRU behavior).
-		// Previously, refreshed chunks kept their original FIFO position and were
-		// evicted first despite being recently written.
+		// Promote to MRU on overwrite to prevent premature eviction of recently refreshed chunks.
 		for i, k := range shard.order {
 			if k == key {
 				shard.order = append(shard.order[:i], shard.order[i+1:]...)
@@ -2417,16 +2181,10 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 	// 2. Add new data
 	shard.total += dataSize
 	newUsed := atomic.AddInt64(&c.used, dataSize)
-	// V246: Use atomic timestamp AND SessionID
-	// V304: Mark as responsive-only if written without SHA1 verification.
-	// FetchBlock paths (STRICT) and pump in STRICT mode write responsiveOnly=false.
 	responsiveOnly := torrstor.IsResponsive()
 	shard.buffers[key] = &RaBuffer{start, end, dataCopy, time.Now().UnixNano(), sessID, responsiveOnly}
 
-	// 3. Strict Eviction Loop (Global)
-	// While we are over budget, evict from THIS shard
-	// V248-Fix: Do NOT evict the very last item (which is likely the one we just added)
-	// before trying global eviction.
+	// Evict from this shard while over budget; keep last item to avoid evicting the chunk just added.
 	for newUsed > globalLimit && len(shard.order) > 1 {
 		v := shard.order[0]
 		shard.order = shard.order[1:]
@@ -2435,13 +2193,11 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 			shard.total -= evictedSize
 			delete(shard.buffers, v)
 			newUsed = atomic.AddInt64(&c.used, -evictedSize)
-			// V294: Recycle evicted data
 			c.recycle(old.data)
 		}
 	}
 
-	// V270: Rescue eviction — local shard exhausted but still over budget.
-	// Trigger global eviction to free stale data from OTHER shards.
+	// Local shard exhausted: trigger global eviction to free stale data from other shards.
 	if newUsed > globalLimit && len(shard.order) <= 1 {
 		c.muContext.Lock()
 		ap := c.activePath
@@ -2452,8 +2208,6 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 		})
 	}
 
-	// 5. Hard Limit: If STILL over budget, DROP
-	// V246: Only drop if we are NOT the first chunk of a new session
 	if newUsed > globalLimit && len(shard.order) == 0 {
 		// If we reach here, it means even after global eviction we are over budget.
 		// However, to allow the new stream to start, we must NOT drop the only chunk it has.
@@ -2475,11 +2229,9 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 
 // Stats returns read-ahead cache statistics for metrics endpoint
 func (c *ReadAheadCache) Stats() (totalBytes int64, activeBytes int64, entries int) {
-	// V244: Use atomic global counter for accurate total
 	totalBytes = atomic.LoadInt64(&c.used)
 
 	now := time.Now().UnixNano()
-	// V250: Coherent 120s threshold for 4K
 	staleThreshold := (120 * time.Second).Nanoseconds()
 
 	for _, shard := range c.shards {
@@ -2496,19 +2248,15 @@ func (c *ReadAheadCache) Stats() (totalBytes int64, activeBytes int64, entries i
 	return totalBytes, activeBytes, entries
 }
 
-// V246: Global Cleanup Logic
-// Iterates all shards and removes:
-// 1. OLD Session Data (Immediate Forced Lock) - Critical for Handoff
-// 2. STALE Data (>30s) (TryLock) - Routine maintenance
+// triggerGlobalEviction removes stale session data and old chunks from all shards.
 func (c *ReadAheadCache) triggerGlobalEviction(activePath string, activeSessionID int64) {
-	// V247: Single-Flight protection
+	// Single-flight: skip if already evicting.
 	if !atomic.CompareAndSwapInt32(&c.isEvicting, 0, 1) {
-		return // Already evicting, skip redundant work
+		return
 	}
-	defer atomic.StoreInt32(&c.isEvicting, 0) // V249: StoreInt32 for consistency
+	defer atomic.StoreInt32(&c.isEvicting, 0)
 
 	now := time.Now().UnixNano()
-	// V250: Increased stale threshold to 120s for 4K stability
 	staleThreshold := (120 * time.Second).Nanoseconds()
 
 	evictShard := func(s *raShard) {
@@ -2520,8 +2268,6 @@ func (c *ReadAheadCache) triggerGlobalEviction(activePath string, activeSessionI
 				if buf.sessionID != activeSessionID && !strings.HasPrefix(key, activePath+":") {
 					keep = false
 				} else {
-					// 2. Stale Check
-					// If it's the active path, we are much more lenient (60s instead of 30s)
 					threshold := staleThreshold
 					if strings.HasPrefix(key, activePath+":") {
 						threshold = (60 * time.Second).Nanoseconds()
@@ -2538,7 +2284,6 @@ func (c *ReadAheadCache) triggerGlobalEviction(activePath string, activeSessionI
 					s.total -= size
 					delete(s.buffers, key)
 					atomic.AddInt64(&c.used, -size)
-					// V294: Recycle globally evicted data
 					c.recycle(buf.data)
 				}
 			}
@@ -2552,8 +2297,6 @@ func (c *ReadAheadCache) triggerGlobalEviction(activePath string, activeSessionI
 
 	skipped := 0
 	for _, s := range c.shards {
-		// V249: NEVER block on a shard lock during global eviction.
-		// If the shard is busy, skip it. We have 32 shards to choose from.
 		if !s.mu.TryLock() {
 			skipped++
 			continue
@@ -2562,8 +2305,7 @@ func (c *ReadAheadCache) triggerGlobalEviction(activePath string, activeSessionI
 		s.mu.Unlock()
 	}
 
-	// V247e-Fix: If all shards were busy under extreme load, force a blocking eviction
-	// on the first shard to guarantee memory is released and prevent budget overflow.
+	// If all shards were busy, force blocking eviction on first shard to prevent budget overflow.
 	if skipped == len(c.shards) {
 		s := c.shards[0]
 		s.mu.Lock()
@@ -2591,7 +2333,6 @@ func extractHashSuffix(filename string) string {
 
 // handlePlexWebhook gestisce i messaggi in arrivo dal server Plex
 func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
-	// V239-Debug: Log entry to confirm connectivity
 	logger.Printf("[PLEX] Webhook connection from %s", r.RemoteAddr)
 
 	var payloadStr string
@@ -2624,9 +2365,9 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		Event    string `json:"event"`
 		Metadata struct {
 			Title              string `json:"title"`
-			GrandparentTitle   string `json:"grandparentTitle"` // V150: Per le serie TV
+			GrandparentTitle   string `json:"grandparentTitle"` // for TV series
 			Year               int    `json:"year"`
-			LibrarySectionType string `json:"librarySectionType"` // V256: Filter by library type
+			LibrarySectionType string `json:"librarySectionType"`
 			Media              []struct {
 				Part []struct {
 					File string `json:"file"`
@@ -2659,8 +2400,6 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		payload.Metadata.LibrarySectionType = "show"
 	}
 
-	// V256: Only process Video libraries (movie/show). Ignore music (artist) and others.
-	// Verified via logs: Movies use "movie", TV Shows use "show", Music uses "artist".
 	if payload.Metadata.LibrarySectionType != "movie" && payload.Metadata.LibrarySectionType != "show" {
 		return
 	}
@@ -2676,9 +2415,7 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			return true
 		})
 
-		// V271: Two-pass matching — exact first, fuzzy only as fallback.
-		// Previously single-pass with sync.Map random iteration caused false positives:
-		// "the housemaid" matched "Ben.The.Men" via Tentativo 4 (first word "the" + year).
+		// Two-pass matching: exact first (IMDB, hash, filename), fuzzy only as fallback.
 
 		// Extract hash suffix from webhook payload (once, outside loop)
 		targetSuffix := ""
@@ -2694,10 +2431,8 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// V281: Extract IMDB ID directly from raw payload string (regex).
-		// Cannot use struct field: Plex sends both lowercase "guid" (string) and
-		// capital "Guid" (array) — Go's case-insensitive json matching would cause
-		// an UnmarshalTypeError if both are in the same struct.
+		// Extract IMDB ID via regex on raw payload (struct unmarshal would cause UnmarshalTypeError
+		// due to Plex sending both lowercase "guid" and capital "Guid" fields).
 		webhookImdbID := ""
 		if m := reImdbID.FindStringSubmatch(payloadStr); len(m) > 1 {
 			webhookImdbID = m[1]
@@ -2717,7 +2452,6 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 				return false
 			}
 
-			// Tentativo 0b: Match per Hash Suffix (V220 - Precision Match)
 			if targetSuffix != "" && extractHashSuffix(path) == targetSuffix {
 				exactMatch = path
 				exactState = state
@@ -2780,15 +2514,13 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 				filename := strings.ToLower(filepath.Base(path))
 				level := 0
 
-				// Tentativo 2: Match per Titolo completo (Movies o Episodio con nome)
-				// V273: Try both dot and underscore separators (gostream uses underscores, some sources use dots)
+				// Tentativo 2: Match per Titolo completo (dot and underscore separators)
 				if targetTitle != "" && (strings.Contains(filename, strings.ReplaceAll(targetTitle, " ", ".")) ||
 					strings.Contains(filename, strings.ReplaceAll(targetTitle, " ", "_"))) {
 					level = 3
 				}
 
-				// Tentativo 3: Match per Titolo Serie (V150 - TV Shows)
-				// V273: Try underscore separator before falling back to first-word heuristic
+				// Tentativo 3: Match per Titolo Serie (TV Shows)
 				if level == 0 && seriesTitle != "" {
 					if strings.Contains(filename, strings.ReplaceAll(seriesTitle, " ", ".")) ||
 						strings.Contains(filename, strings.ReplaceAll(seriesTitle, " ", "_")) {
@@ -2804,8 +2536,7 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-				// Tentativo 4: Match per prima parola + anno (fallback estremo)
-				// V271: Require first word length > 3 to prevent "the", "a", "an" false positives
+				// Tentativo 4: Match per prima parola + anno (first word > 3 chars to avoid "the", "a")
 				if level == 0 && len(strings.Fields(targetTitle)) > 0 {
 					firstWord := strings.Fields(targetTitle)[0]
 					if len(firstWord) > 3 && strings.Contains(filename, firstWord) {
@@ -2829,9 +2560,8 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		if exactMatch != "" && exactState != nil {
 			exactState.SetHealthy(true)
 			exactState.mu.Lock()
-			exactState.IsStopped = false // V272: Reset stop flag on re-play
-			// V305: Cache webhookImdbID into state if missing — enables fast IMDB match (0a)
-			// on future sessions for files created without IMDB ID in line 4.
+			exactState.IsStopped = false
+			// Cache webhookImdbID into state for fast IMDB matching in future sessions.
 			if exactState.ImdbID == "" && webhookImdbID != "" {
 				exactState.ImdbID = webhookImdbID
 				logger.Printf("[PLEX] IMDB ID cached for future matching: %s → %s", filepath.Base(exactMatch), webhookImdbID)
@@ -2839,26 +2569,20 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			exactState.mu.Unlock()
 			logger.Printf("[PLEX] Playback confirmed by webhook for: %s", filepath.Base(exactMatch))
 
-			// V185: Link priority to core Torrent engine
 			if exactState.Hash != "" {
 				h := metainfo.NewHashFromHex(exactState.Hash)
 				if t := web.BTS.GetTorrent(h); t != nil {
 					t.IsPriority = true
-					// V238: Unlock full aggression for confirmed playback (AI Pilot has final say)
 					t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
-					logger.Printf("[PLEX] High Priority + FULL Aggressive Mode enabled for torrent: %s", exactState.Hash)
+					logger.Printf("[PLEX] High Priority + Aggressive Mode for: %s", exactState.Hash)
 				}
 			}
 		}
 	} else if payload.Event == "media.stop" {
-		// V255: Ignore media.pause entirely — pause is a player-side concept.
-		// The torrent must keep downloading at full speed so resume is instant.
-		// Plex never sends media.resume, so disabling anything on pause breaks resume.
 		targetTitle := strings.ToLower(payload.Metadata.Title)
 		seriesTitle := strings.ToLower(payload.Metadata.GrandparentTitle)
 		targetYear := payload.Metadata.Year
 
-		// V271: Two-pass matching for media.stop (same as media.play fix)
 		stopTargetSuffix := ""
 		for _, m := range payload.Metadata.Media {
 			for _, p := range m.Part {
@@ -2872,7 +2596,6 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// V281: Extract IMDB ID from raw payload (same regex, see media.play)
 		stopImdbID := ""
 		if m := reImdbID.FindStringSubmatch(payloadStr); len(m) > 1 {
 			stopImdbID = m[1]
@@ -2885,7 +2608,6 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			path := key.(string)
 			state := value.(*PlaybackState)
 
-			// V281: IMDB ID match — immune a titoli localizzati
 			if stopImdbID != "" && state.ImdbID != "" && state.ImdbID == stopImdbID {
 				stopMatch = path
 				stopState = state
@@ -2918,13 +2640,11 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 				filename := strings.ToLower(filepath.Base(path))
 				level := 0
 
-				// V273: Try both dot and underscore separators
 				if targetTitle != "" && (strings.Contains(filename, strings.ReplaceAll(targetTitle, " ", ".")) ||
 					strings.Contains(filename, strings.ReplaceAll(targetTitle, " ", "_"))) {
 					level = 3
 				}
 
-				// V273: Try underscore separator before falling back to first-word heuristic
 				if level == 0 && seriesTitle != "" {
 					if strings.Contains(filename, strings.ReplaceAll(seriesTitle, " ", ".")) ||
 						strings.Contains(filename, strings.ReplaceAll(seriesTitle, " ", "_")) {
@@ -2961,11 +2681,10 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		if stopMatch != "" && stopState != nil {
 			stopState.SetHealthy(false)
 			stopState.mu.Lock()
-			stopState.IsStopped = true // V272: Mark explicit stop for fast-drop
+			stopState.IsStopped = true
 			stopState.mu.Unlock()
 			logger.Printf("[PLEX] Priority removed for: %s (Event: %s)", filepath.Base(stopMatch), payload.Event)
 
-			// V271: Force-terminate the active pump on media.stop.
 			if val, ok := activePumps.Load(stopMatch); ok {
 				ps := val.(*NativePumpState)
 				if ps.cancel != nil {
@@ -2975,7 +2694,6 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 				logger.Printf("[PLEX] STOP: force-terminated pump for %s", filepath.Base(stopMatch))
 			}
 
-			// V304: Reset Adaptive Shield on media.stop — clean slate for next viewing
 			torrstor.ResetShield()
 			logger.Printf("[AdaptiveShield] Shield reset on media.stop")
 
@@ -3017,14 +2735,13 @@ func main() {
 
 	source, mount := flag.Arg(0), flag.Arg(1)
 
-	// Load configuration first (FASE 4.16) — needed before path check to allow config fallback
 	globalConfig = LoadConfig()
+	prowlarrClient = prowlarr.NewClient(globalConfig.Prowlarr)
+	SendHeartbeat(globalConfig)
 	logger.Printf("[DEBUG] BlockListURL loaded: '%s'", globalConfig.BlockListURL)
 
-	// V150: Centralize paths (Phase 3)
 	if dbPath != "" {
-		// V1.4.6-Fix: If dbPath is a directory, use it directly as RootPath.
-		// If it's a file (e.g. config.json), use its parent directory.
+		// If dbPath is a directory, use it as RootPath; if a file, use its parent.
 		if fi, err := os.Stat(dbPath); err == nil && fi.IsDir() {
 			globalConfig.RootPath = dbPath
 		} else {
@@ -3052,7 +2769,6 @@ func main() {
 
 	globalConfig.LogConfig(logger)
 
-	// V144-Integration: Start Embedded GoStorm Engine
 	go func() {
 		logger.Println("Starting Embedded GoStorm Engine...")
 		server.Start() // Starts Web Server on 8090 and Engine
@@ -3060,28 +2776,17 @@ func main() {
 	// Give engine a moment to init (hash maps etc)
 	time.Sleep(2 * time.Second)
 
-	// V256: Initialize disk warmup cache after settings are loaded
 	InitDiskWarmup()
-
-	// V1.4.6-Fix: Self-healing registry watchdog (remove ghosts every 24h)
 	go StartRegistryWatchdog(backgroundStopChan)
-
-	// V228: Launch NAT-PMP sidecar (independent of FUSE, uses backgroundStopChan)
 	go natpmpLoop(backgroundStopChan, globalConfig.NatPMP, logger)
 
-	// Initialize global concurrency controls (V226: Unified Master Semaphore)
-	// Strictly honors MasterConcurrencyLimit (default: 25) for all data requests
 	masterDataSemaphore = make(chan struct{}, globalConfig.MasterConcurrencyLimit)
-
-	// V239: Start Orphan Handle Garbage Collector
 	startHandleGC()
 
 	// Initialize global helpers
 	globalRateLimiter = NewRateLimiter(globalConfig.RateLimitRequestsPerSec, 1*time.Second)
 	globalLockManager = NewLockManager(1 * time.Hour)
 
-	// V143-Performance: Initialize buffer pool with dynamic size based on Config
-	// BUG-5: pool size matches ReadAheadBase (doubled-chunk from V238 no longer used)
 	poolSize := int(globalConfig.ReadAheadBase)
 	if poolSize == 0 {
 		poolSize = 16 * 1024 * 1024
@@ -3094,41 +2799,27 @@ func main() {
 	}
 	logger.Printf("ReadBufferPool initialized with size: %d bytes (matches ReadAheadBase)", poolSize)
 
-	// V79: Initialize httpClient with globalConfig timeout values
-	// This fixes the 11.8x performance degradation caused by hardcoded 5s timeout
-	// V80-Connection-Optimization: Increased from Python values (10/15) to leverage Go efficiency
-	// Python needed 15 due to GIL constraints, Go can handle more with lower overhead
-	// Target: Match GoStorm max seeders (25) + overhead while maintaining low latency I/O
 	httpClient = &http.Client{
 		Transport: &http.Transport{
-			// Dialer configuration - matches Python socket creation
 			DialContext: (&net.Dialer{
-				Timeout:   globalConfig.HTTPConnectTimeout, // 10s (matches Python CONNECT_TIMEOUT)
-				KeepAlive: 30 * time.Second,                // Keep TCP connection alive
+				Timeout:   globalConfig.HTTPConnectTimeout,
+				KeepAlive: 30 * time.Second,
 			}).DialContext,
 
-			// Connection pool limits - OPTIMIZED FOR GO EFFICIENCY
-			// V81: Increased to 64 based on real-world multi-stream testing
-			// V80 at 30 removed the 270Mbps cap and achieved stable 250-400Mbps peaks
-			// Increasing all three parameters together ensures optimal connection reuse
-			MaxIdleConns:        globalConfig.MaxIdleConns,        // Global pool size (up from 30)
-			MaxIdleConnsPerHost: globalConfig.MaxIdleConnsPerHost, // Keep up to 64 idle connections ready (up from 30)
-			MaxConnsPerHost:     globalConfig.MaxConnsPerHost,     // Cap total connections to 64 (up from 30)
+			MaxIdleConns:        globalConfig.MaxIdleConns,
+			MaxIdleConnsPerHost: globalConfig.MaxIdleConnsPerHost,
+			MaxConnsPerHost:     globalConfig.MaxConnsPerHost,
 
-			// Timeouts
-			ResponseHeaderTimeout: globalConfig.HTTPReadTimeout, // 45s (matches Python READ_TIMEOUT)
-			IdleConnTimeout:       90 * time.Second,             // Close idle connections after 90s
-			TLSHandshakeTimeout:   10 * time.Second,             // TLS handshake timeout (even for localhost)
-			ExpectContinueTimeout: 1 * time.Second,              // Expect: 100-continue timeout
+			ResponseHeaderTimeout: globalConfig.HTTPReadTimeout,
+			IdleConnTimeout:       90 * time.Second, // Close idle connections after 90s
+			TLSHandshakeTimeout:   10 * time.Second, // TLS handshake timeout (even for localhost)
+			ExpectContinueTimeout: 1 * time.Second,  // Expect: 100-continue timeout
 
 			// HTTP protocol settings - match Python defaults
 			DisableKeepAlives:  false, // Enable HTTP keepalive (Python default)
 			DisableCompression: false, // Enable gzip compression (Python default)
 			ForceAttemptHTTP2:  false, // Use HTTP/1.1 only (Python urllib3 default)
 
-			// V86-Gold: Increased buffer sizes for high-throughput streaming
-			// 64KB buffers reduce syscall overhead for 50GB+ file transfers
-			// Memory impact: 64KB × ConcurrencyLimit (64) = 4MB max (acceptable on Pi)
 			WriteBufferSize: globalConfig.WriteBufferSize,
 			ReadBufferSize:  globalConfig.ReadBufferSize,
 		},
@@ -3136,21 +2827,33 @@ func main() {
 	logger.Printf("HTTP client initialized: ConnectTimeout=%v, ReadTimeout=%v, MaxIdleConns=%d, MaxIdleConnsPerHost=%d, MaxConnsPerHost=%d (V81-optimized)",
 		globalConfig.HTTPConnectTimeout, globalConfig.HTTPReadTimeout, globalConfig.MaxIdleConns, globalConfig.MaxIdleConnsPerHost, globalConfig.MaxConnsPerHost)
 
-	// V160: Initialize Native Bridge for Zero-Network metadata operations
 	nativeBridge = NewNativeClient()
 
-	// V1.4.5: Start AI Optimizer Sidecar (if configured)
 	if globalConfig.AIURL != "" {
-		go ai.StartAITuner(context.Background(), globalConfig.AIURL)
+		provider := ai.AIProvider{
+			URL:     globalConfig.AIURL,
+			APIKey:  globalConfig.AI_API_KEY,
+			Model:   globalConfig.AIModel,
+			IsLocal: globalConfig.AIProvider == "" || globalConfig.AIProvider == "local",
+			GetBufferPct: func() int {
+				total, _, _ := raCache.Stats()
+				budget := globalConfig.ReadAheadBudget
+				if budget <= 0 {
+					return 100
+				}
+				pct := int(total * 100 / budget)
+				if pct > 100 {
+					pct = 100
+				}
+				return pct
+			},
+		}
+		go ai.StartAITuner(context.Background(), provider)
 	}
 
-	// V298: Automatic BlockList Update
 	if globalConfig.BlockListURL != "" {
 		safeGo(func() {
-			// Initial update
 			updateBlockList(globalConfig.BlockListURL)
-
-			// Periodic update every 24 hours
 			ticker := time.NewTicker(24 * time.Hour)
 			defer ticker.Stop()
 			for {
@@ -3164,16 +2867,16 @@ func main() {
 		})
 	}
 
-	// V79: Initialize peerPreloader after httpClient is ready
-	// V160: Updated to use Native Bridge
+	safeGo(func() {
+		updater.Start(AppVersion, backgroundStopChan)
+	})
+
 	peerPreloader = NewPeerPreloader(nativeBridge)
 
-	// Initialize metadata LRU cache (FASE 3.1)
-	// Capacity from config (default 50MB - V178 Optimization), 24h TTL
+	// Metadata LRU cache: capacity from config, 24h TTL.
 	metaCache = NewLRUCache(globalConfig.MetadataCacheSize, 24*time.Hour)
 
-	// V133: Initialize inode map for deterministic inode generation
-	// This ensures Plex doesn't see "new files" after proxy restarts
+	// Deterministic inode map ensures Plex doesn't see "new files" after restarts.
 	inodeMapPath := filepath.Join(GetStateDir(), "inode_map.json")
 	if err := InitGlobalInodeMap(inodeMapPath, logger); err != nil {
 		logger.Printf("WARNING: Failed to initialize inode map: %v (falling back to filename hash)", err)
@@ -3182,29 +2885,55 @@ func main() {
 		logger.Printf("InodeMap: Initialized with %d files, %d dirs from %s", files, dirs, inodeMapPath)
 	}
 
-	// Start background cache pre-population (FASE 3.2)
-	// This dramatically improves Plex scan performance
+	// V1.7.1: Optional SQLite State DB for unified persistence.
+	if globalConfig.EnableStateDB {
+		dbPath := globalConfig.StateDBPath
+		if dbPath == "" {
+			dbPath = filepath.Join(GetStateDir(), "gostream.db")
+		}
+		var err error
+		stateDB, err = metadb.New(dbPath, logger)
+		if err != nil {
+			logger.Printf("WARNING: Failed to open StateDB: %v (falling back to JSON)", err)
+			stateDB = nil
+		} else {
+			// Migrate JSON files if needed
+			if err := stateDB.MigrateFromJSON(GetStateDir()); err != nil {
+				logger.Printf("WARNING: StateDB migration failed: %v (falling back to JSON)", err)
+				stateDB.Close()
+				stateDB = nil
+			} else {
+				// Wire up DB to InodeMap, then reload from DB (covers boot 2+ where JSON is gone)
+				globalInodeMap.SetDB(stateDB)
+				if err := globalInodeMap.LoadFromDisk(); err != nil {
+					logger.Printf("WARNING: Failed to reload InodeMap from DB: %v", err)
+				}
+				SetRegistryDB(stateDB)
+				logger.Printf("[StateDB] Active: %s", dbPath)
+			}
+		}
+	}
+
+	// Pre-populate cache at startup to improve Plex scan performance.
 	cacheBuilder := NewStartupCacheBuilder(source, metaCache, logger)
 	cacheBuilder.Start()
 
-	// Initialize and start cleanup manager (FASE 3.3)
-	// V238: Integrated metaCache and nativeBridge for centralized resource management (Audit 1.A)
 	globalCleanupManager = NewCleanupManager(logger, peerPreloader, metaCache, nativeBridge)
 	globalCleanupManager.Start()
 
-	// Initialize torrent remover (FASE 4.2)
-	// V160: Updated to use Native Bridge
 	globalTorrentRemover = NewTorrentRemover(nativeBridge, logger)
-
-	// Initialize sync cache manager (FASE 4.13)
 	globalSyncCacheManager = NewSyncCacheManager(GetStateDir(), logger)
 
-	// V83: Load caches from disk into memory (one-time at startup)
+	// V1.7.1: Wire up StateDB to sync cache manager (after it's created)
+	if stateDB != nil {
+		globalSyncCacheManager.SetDB(stateDB)
+	}
+
 	if err := globalSyncCacheManager.LoadCachesFromDisk(); err != nil {
 		logger.Printf("WARNING: Failed to load sync caches from disk: %v", err)
 	}
 
-	// V83: Start background sync to disk (every 30s)
+	// Sync caches to disk every 30s.
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -3235,7 +2964,6 @@ func main() {
 		}
 	}()
 
-	// V140: Initialize directory cache (10s TTL - balances interactivity with IO reduction)
 	globalDirCache = NewDirCache(10 * time.Second)
 
 	http.HandleFunc("/plex/webhook", handlePlexWebhook)
@@ -3254,10 +2982,10 @@ func main() {
 		raActivePercent := float64(raActive) / float64(raBudget) * 100
 		raStalePercent := float64(raStale) / float64(raBudget) * 100
 
-		// V229: Expose NAT-PMP port from atomic memory (Zero-Overhead)
 		natPort := atomic.LoadInt64(&currentNatPort)
 
-		fmt.Fprintf(w, `{"version":"V265-Stable", "config_source":"%s", "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d}`,
+		fmt.Fprintf(w, `{"version":"%s", "config_source":"%s", "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d, "latest_version":"%s", "update_available":%t}`,
+			AppVersion,
 			globalConfig.ConfigPath,
 			time.Since(startTime),
 			cacheStats.Entries, float64(cacheStats.Size)/(1024*1024),
@@ -3268,20 +2996,20 @@ func main() {
 			syncCacheStats.FullpackCacheEntries,
 			globalConfig.StreamingThreshold/1024,
 			globalConfig.PreloadWorkers,
-			globalConfig.MaxConnsPerHost, // V81: MaxConnsPerHost value
+			globalConfig.MaxConnsPerHost,
 			raTotal, raActive, raStale, raEntries, raBudget,
 			raPercent, raActivePercent, raStalePercent,
-			natPort)
+			natPort,
+			updater.LatestVersion(), updater.UpdateAvailable())
 	})
 
-	// V145-Webhook: Register Plex Webhook handler for priority management
 	http.HandleFunc("/webhook", handlePlexWebhook)
 
-	// V79-Profiling: Detailed performance profiling endpoint
 	http.HandleFunc("/metrics/profiling", func(w http.ResponseWriter, r *http.Request) {
 		totalReads, cacheHits, httpFetches, streamingReads, avgHTTPLatency, avgCacheLatency, cacheHitRate := globalProfilingStats.Stats()
 
-		fmt.Fprintf(w, `{"version":"V155-Unified", "total_reads":%d, "cache_hits":%d, "cache_hit_rate_pct":%.2f, "http_fetches":%d, "streaming_reads":%d, "non_streaming_reads":%d, "avg_http_latency_ms":%.2f, "avg_cache_latency_ms":%.2f, "max_conns_per_host":%d}`,
+		fmt.Fprintf(w, `{"version":"%s", "total_reads":%d, "cache_hits":%d, "cache_hit_rate_pct":%.2f, "http_fetches":%d, "streaming_reads":%d, "non_streaming_reads":%d, "avg_http_latency_ms":%.2f, "avg_cache_latency_ms":%.2f, "max_conns_per_host":%d}`,
+			AppVersion,
 			totalReads,
 			cacheHits,
 			cacheHitRate,
@@ -3290,7 +3018,7 @@ func main() {
 			totalReads-streamingReads,
 			float64(avgHTTPLatency.Microseconds())/1000.0,
 			float64(avgCacheLatency.Microseconds())/1000.0,
-			globalConfig.MaxConnsPerHost) // V81: MaxConnsPerHost value (was missing, caused %!d(MISSING) bug)
+			globalConfig.MaxConnsPerHost)
 	})
 
 	http.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
@@ -3319,6 +3047,7 @@ func main() {
 			// Reload in memory (V1.4.0 Live Update)
 			oldURL := globalConfig.BlockListURL
 			globalConfig = LoadConfig()
+			prowlarrClient = prowlarr.NewClient(globalConfig.Prowlarr)
 			if globalConfig.BlockListURL != "" && globalConfig.BlockListURL != oldURL {
 				safeGo(func() {
 					updateBlockList(globalConfig.BlockListURL)
@@ -3327,6 +3056,35 @@ func main() {
 			logger.Printf("[Config] Updated via Dashboard API")
 			w.WriteHeader(200)
 		}
+	})
+
+	http.HandleFunc("/api/prowlarr/search", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if prowlarrClient == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(`[]`))
+			return
+		}
+		imdbID := r.URL.Query().Get("imdb_id")
+		contentType := r.URL.Query().Get("type")
+		title := r.URL.Query().Get("title")
+		if imdbID == "" {
+			http.Error(w, "missing imdb_id parameter", http.StatusBadRequest)
+			return
+		}
+		if contentType == "" {
+			contentType = "movie"
+		}
+		streams := prowlarrClient.FetchTorrents(imdbID, contentType, title)
+		if streams == nil {
+			streams = []prowlarr.Stream{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(streams)
 	})
 
 	http.HandleFunc("/api/restart", func(w http.ResponseWriter, r *http.Request) {
@@ -3349,10 +3107,125 @@ func main() {
 		}()
 	})
 
-	go http.ListenAndServe(":8096", nil)
+	// Sync Scheduler (Fase 1)
+	if globalConfig.Scheduler.Enabled {
+		schedCfg := scheduler.SchedulerConfig{
+			Enabled:       globalConfig.Scheduler.Enabled,
+			MoviesSync:    scheduler.DailyJobConfig(globalConfig.Scheduler.MoviesSync),
+			TVSync:        scheduler.DailyJobConfig(globalConfig.Scheduler.TVSync),
+			WatchlistSync: scheduler.WatchlistSyncConfig(globalConfig.Scheduler.WatchlistSync),
+		}
 
-	// V133: Setup signal handler for graceful shutdown
-	// This ensures inode map is saved before exit
+		statePath := filepath.Join(GetStateDir(), "scheduler_state.json")
+
+		logsDir := filepath.Join(filepath.Dir(globalConfig.ConfigPath), "logs")
+
+		// Start midnight log truncation
+		engines.StartLogTruncator(logsDir, backgroundStopChan)
+
+		syncers := map[string]scheduler.Syncer{
+			"movies": engines.NewMoviesSyncer(engines.MoviesSyncerConfig{
+				GoStormURL:   globalConfig.GoStormBaseURL,
+				TMDBAPIKey:   globalConfig.TMDBAPIKey,
+				TorrentioURL: globalConfig.TorrentioURL,
+				PlexURL:      globalConfig.Plex.URL,
+				PlexToken:    globalConfig.Plex.Token,
+				PlexLib:      globalConfig.Plex.LibraryID,
+				MoviesDir:    filepath.Join(globalConfig.PhysicalSourcePath, "movies"),
+				StateDir:     GetStateDir(),
+				LogsDir:      logsDir,
+				ProwlarrCfg:  globalConfig.Prowlarr,
+			}),
+			"tv": engines.NewTVSyncer(engines.TVSyncerConfig{
+				GoStormURL:   globalConfig.GoStormBaseURL,
+				TMDBAPIKey:   globalConfig.TMDBAPIKey,
+				TorrentioURL: globalConfig.TorrentioURL,
+				PlexURL:      globalConfig.Plex.URL,
+				PlexToken:    globalConfig.Plex.Token,
+				PlexTVLib:    globalConfig.Plex.TVLibraryID,
+				TVDir:        filepath.Join(globalConfig.PhysicalSourcePath, "tv"),
+				StateDir:     GetStateDir(),
+				LogsDir:      logsDir,
+				ProwlarrCfg:  globalConfig.Prowlarr,
+				DB:           stateDB,
+			}),
+			"watchlist": engines.NewWatchlistSyncer(engines.WatchlistSyncerConfig{
+				GoStormURL:      globalConfig.GoStormBaseURL,
+				TMDBAPIKey:      globalConfig.TMDBAPIKey,
+				TorrentioURL:    globalConfig.TorrentioURL,
+				PlexURL:         globalConfig.Plex.URL,
+				PlexToken:       globalConfig.Plex.Token,
+				PlexSection:     globalConfig.Plex.LibraryID,
+				MoviesDir:       filepath.Join(globalConfig.PhysicalSourcePath, "movies"),
+				MediaServerType: globalConfig.MediaServerType,
+				LogsDir:         logsDir,
+				ProwlarrCfg:     globalConfig.Prowlarr,
+			}),
+		}
+
+		sched := scheduler.New(schedCfg, syncers, statePath)
+
+		http.HandleFunc("/api/scheduler/status", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sched.Status())
+		})
+		http.HandleFunc("/api/scheduler/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST only", 405)
+				return
+			}
+			path := strings.TrimPrefix(r.URL.Path, "/api/scheduler/")
+			if strings.HasSuffix(path, "/stop") {
+				name := strings.TrimSuffix(path, "/stop")
+				if err := sched.StopJob(name); err != nil {
+					http.Error(w, err.Error(), 409)
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			name := strings.TrimSuffix(path, "/run")
+			if err := sched.TriggerRun(name); err != nil {
+				http.Error(w, err.Error(), 409)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+		})
+
+		safeGo(func() {
+			sched.Run(backgroundStopChan)
+		})
+		logger.Printf("[Scheduler] enabled (Go native)")
+	}
+
+	// Health Monitor + Dashboard (Fase 5)
+	monCollector := collector.New(
+		"http://127.0.0.1:8090",
+		globalConfig.FuseMountPath,
+		physicalSourcePath,
+		globalConfig.NatPMP.VPNInterface,
+		globalConfig.Plex.URL,
+		globalConfig.Plex.Token,
+		globalConfig.NatPMP.LocalPort,
+		globalConfig.MetricsPort,
+	)
+	logsDir := filepath.Join(filepath.Dir(globalConfig.ConfigPath), "logs")
+	dashHandler := dashboard.New(monCollector, logsDir)
+	http.HandleFunc("/dashboard", dashHandler.Dashboard)
+	http.HandleFunc("/api/health", dashHandler.Health)
+	http.HandleFunc("/api/torrents", dashHandler.Torrents)
+	http.HandleFunc("/api/speed-history", dashHandler.SpeedHistory)
+	http.HandleFunc("/api/logs", dashHandler.Logs)
+	http.HandleFunc("/api/plex-thumb", dashHandler.PlexThumb)
+	http.HandleFunc("/api/kill-stream/", dashHandler.KillStream)
+	safeGo(func() {
+		monCollector.Run(backgroundStopChan)
+	})
+	logger.Printf("[Dashboard] enabled at :%d/dashboard", globalConfig.MetricsPort)
+
+	go http.ListenAndServe(fmt.Sprintf(":%d", globalConfig.MetricsPort), nil)
+
+	// Graceful shutdown: saves inode map and sync caches before exit.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	var server *fuse.Server // Declare here to be accessible in goroutine
@@ -3383,7 +3256,7 @@ func main() {
 
 		// CRITICAL FIX: Stop all background managers explicitly before os.Exit()
 		// because defer statements are bypassed by os.Exit().
-		backgroundStopOnce.Do(func() { close(backgroundStopChan) }) // V227: Safe single close
+		backgroundStopOnce.Do(func() { close(backgroundStopChan) })
 
 		if globalRateLimiter != nil {
 			globalRateLimiter.Stop()
@@ -3437,22 +3310,16 @@ func main() {
 
 	logger.Printf("FUSE mounted at %s with VirtualMkvRoot, all systems active", mount)
 
-	// V255: SMB D-state watchdog — detects smbd processes stuck on FUSE I/O
-	// and triggers graceful self-restart before the Synology CIFS mount goes stale.
 	go smbdWatchdog()
 
 	server.Wait()
 }
 
-// V255: SMB D-state watchdog
-// Detects smbd child processes stuck in D-state (uninterruptible sleep on FUSE I/O).
-// When smbd enters D-state, the Synology CIFS mount becomes unresponsive and can't
-// be remounted until gostream restarts (only way to unblock kernel FUSE operations).
-// Strategy: Level 1 (3 hits, 180s) - Emergency Unblock (Interrupt all pumps).
-//           Level 2 (10 hits, 600s) - Graceful Restart (Last resort).
+// smbdWatchdog detects smbd processes stuck in D-state (uninterruptible FUSE I/O).
+// Level 1 (3 hits / 180s): interrupt all pumps. Level 2 (10 hits / 600s): graceful restart.
 func smbdWatchdog() {
 	const checkInterval = 60 * time.Second
-	const unblockThreshold = 3 // 180s - Emergency unblock (interrupt all pumps)
+	const unblockThreshold = 3  // 180s - Emergency unblock (interrupt all pumps)
 	const restartThreshold = 10 // 600s - Full restart (persistent stall)
 	consecutiveHits := 0
 
@@ -3464,28 +3331,24 @@ func smbdWatchdog() {
 			consecutiveHits++
 			logger.Printf("[Watchdog] D-state smbd detected (%d/%d)", consecutiveHits, restartThreshold)
 
-			// FASE 1: Sblocco di emergenza (3 minuti)
+			// Level 1 (3 consecutive hits): soft-interrupt all pumps to unblock hung FUSE reads.
+			// Only closes pipe readers — pumps stay alive and will retry on next FUSE read.
+			// Preserves pump survival during temporary peer shortages (swarm may recover).
 			if consecutiveHits == unblockThreshold {
-				logger.Printf("[Watchdog] D-state persistent for %ds — triggering EMERGENCY UNBLOCK",
+				logger.Printf("[Watchdog] D-state persistent for %ds — triggering soft interrupt (pumps stay alive)",
 					consecutiveHits*int(checkInterval/time.Second))
-
-				// Interrompiamo tutti i reader attivi per sbloccare le Read() appese.
-				// Questo causa errori I/O temporanei per Samba/Plex ma dovrebbe sbloccare il kernel.
 				activePumps.Range(func(key, value interface{}) bool {
 					if ps, ok := value.(*NativePumpState); ok {
 						if ps.reader != nil {
-							logger.Printf("[Watchdog] Interrupting pump: %s", filepath.Base(ps.path))
+							logger.Printf("[Watchdog] Soft-interrupting pump: %s", filepath.Base(ps.path))
 							ps.reader.Interrupt()
-						}
-						if ps.cancel != nil {
-							ps.cancel() // Stop the background pumping loop
 						}
 					}
 					return true
 				})
 			}
 
-			// FASE 2: Riavvio completo (10 minuti)
+			// Level 2 (10 consecutive hits): graceful restart.
 			if consecutiveHits >= restartThreshold {
 				logger.Printf("[Watchdog] D-state STILL persistent for %ds — triggering graceful restart",
 					consecutiveHits*int(checkInterval/time.Second))
@@ -3519,7 +3382,6 @@ func countDStateSmbd() int {
 	return count
 }
 
-// V239: Start Orphan Handle Garbage Collector
 func startHandleGC() {
 	ticker := time.NewTicker(15 * time.Minute)
 	safeGo(func() {

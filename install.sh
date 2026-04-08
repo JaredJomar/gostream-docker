@@ -7,7 +7,7 @@
 set -e
 
 # ------------------------------------------------------------------------------
-# Color output (graceful fallback when not running in a terminal)
+# Color output — standard 8-color + 256-color palette
 # ------------------------------------------------------------------------------
 if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
     RED=$(tput setaf 1)
@@ -16,6 +16,7 @@ if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
     BLUE=$(tput setaf 4)
     BOLD=$(tput bold)
     NC=$(tput sgr0)
+    _ncolors=$(tput colors 2>/dev/null || echo 8)
 else
     RED='\033[0;31m'
     GREEN='\033[0;32m'
@@ -23,43 +24,222 @@ else
     BLUE='\033[0;34m'
     BOLD='\033[1m'
     NC='\033[0m'
+    _ncolors=8
+fi
+
+# 256-color palette (ANSI 38;5;N — falls back to standard colors)
+if [ "${_ncolors:-8}" -ge 256 ] 2>/dev/null; then
+    P1=$'\e[38;5;27m'    # deep blue       (logo line 1)
+    P2=$'\e[38;5;33m'    # blue            (logo line 2)
+    P3=$'\e[38;5;39m'    # blue-cyan       (logo line 3)
+    P4=$'\e[38;5;45m'    # cyan            (logo line 4)
+    P5=$'\e[38;5;51m'    # bright cyan     (logo line 5/6)
+    PDIM=$'\e[38;5;240m' # dark gray       (decorative lines)
+    PSUB=$'\e[38;5;246m' # medium gray     (subtitle / payoff)
+    PGRN=$'\e[38;5;82m'  # bright green    (ok icon)
+    PYLW=$'\e[38;5;220m' # amber           (warn icon)
+    PRED=$'\e[38;5;196m' # bright red      (err icon)
+    PTEAL=$'\e[38;5;45m' # teal            (header accent)
+    PBOX=$'\e[38;5;33m'  # blue            (summary box)
+    PRST=$'\e[0m'
+else
+    P1="$BLUE"; P2="$BLUE"; P3="$BLUE"; P4="$BLUE"; P5="$BLUE"
+    PDIM="$NC"; PSUB="$NC"; PGRN="$GREEN"; PYLW="$YELLOW"; PRED="$RED"
+    PTEAL="$BLUE"; PBOX="$BLUE"; PRST="$NC"
 fi
 
 # ------------------------------------------------------------------------------
-# Helper: print a colored section header
+# Terminal width helpers
 # ------------------------------------------------------------------------------
-print_header() {
+get_cols() { tput cols 2>/dev/null || echo 80; }
+
+# Full-width horizontal rule: print_hr [color] [char]
+print_hr() {
+    local col="${1:-$PDIM}" char="${2:-─}"
+    local w; w=$(get_cols)
+    printf "%s  " "$col"
+    local _i; for ((_i=0; _i<w-4; _i++)); do printf "%s" "$char"; done
+    printf "%s\n" "$PRST"
+}
+
+# Centered wizard form: width of the centered block and its left padding
+FORM_W=64
+form_pad() {
+    local cols; cols=$(get_cols)
+    local p=$(( (cols - FORM_W) / 2 ))
+    echo $(( p < 2 ? 2 : p ))
+}
+
+# ------------------------------------------------------------------------------
+# Funny messages — one per phase category
+# ------------------------------------------------------------------------------
+_MSGS_SETUP=(
+    "OMG am I doing this for real?! Say goodbye to my grades."
+    "Am I ditching all the other services? Sorry Netflix, it's not me, it's definitely you."
+    "Look at me saving money for more beers... I mean, 'soda'. Obviously."
+)
+_MSGS_WORK=(
+    "Loading... honestly, I'm just as bored as you are right now."
+    "Wait, I'm actually working? Someone call my mom, she won't believe it."
+    "Don't mind me, just downloading your next 3 a.m. obsession."
+)
+_MSGS_DONE=(
+    "Aaaand done. Now go rot on the couch like the legend you are."
+    "We're in. If anyone asks, you're 'studying'. I got your back."
+    "Setup finished. Go ahead, ignore those 47 unread texts. You deserve this."
+)
+
+# Pick a random element from a named array (bash 3.2 compatible — no nameref)
+pick_msg() {
+    local _arr="$1"
+    local _len; eval "_len=\${#${_arr}[@]}"
+    [ "$_len" -eq 0 ] && return
+    local _idx=$(( RANDOM % _len ))
+    eval "echo \"\${${_arr}[$_idx]}\""
+}
+
+# ------------------------------------------------------------------------------
+# Progress bar for [3/3] Install phase
+# ------------------------------------------------------------------------------
+_STEP=0
+_STEPS=9  # clone, deploy, config, dirs, services, enable, sudoers, compile, verify
+
+step_start() {
+    (( _STEP++ )) || true
+    local label="$1"
+    local cols; cols=$(get_cols)
+    local msg; msg=$(pick_msg _MSGS_WORK)
+
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    draw_logo
+
+    local bar_w=$(( cols - 16 ))
+    local _i
+
+    # Phase bar — always 3/3, pre-filled to 2/3
+    local ph_filled=$(( bar_w * 2 / 3 ))
+    local ph_empty=$(( bar_w - ph_filled ))
+    printf "  %s" "$P3"
+    for ((_i=0; _i<ph_filled; _i++)); do printf "█"; done
+    printf "%s" "$PDIM"
+    for ((_i=0; _i<ph_empty; _i++)); do printf "░"; done
+    printf "%s  %sPhase 3/3%s\n" "$PRST" "$PSUB" "$PRST"
+    printf "  %s%s◆  [3/3] Installing%s%s\n\n" "$PTEAL$BOLD" "$PRST" "$NC$PRST" ""
+
+    # Step bar — secondary (▓ fill char to distinguish from phase bar)
+    local st_filled=$(( bar_w * _STEP / _STEPS ))
+    local st_empty=$(( bar_w - st_filled ))
+    printf "  %s" "$P4"
+    for ((_i=0; _i<st_filled; _i++)); do printf "▓"; done
+    printf "%s" "$PDIM"
+    for ((_i=0; _i<st_empty; _i++)); do printf "░"; done
+    printf "%s  %s%d/%d%s\n" "$PRST" "$PSUB" "$_STEP" "$_STEPS" "$PRST"
     echo ""
-    echo "${BOLD}${BLUE}=== $1 ===${NC}"
+    printf "  %s▸  %s%s%s\n" "$PTEAL" "$BOLD" "$label" "$NC$PRST"
+    echo ""
+    printf "  %s%s%s\n" "$PSUB" "$msg" "$PRST"
+    print_hr "$PDIM"
     echo ""
 }
 
-print_ok()   { echo "  ${GREEN}✓${NC} $1"; }
-print_warn() { echo "  ${YELLOW}⚠${NC}  $1"; }
-print_err()  { echo "  ${RED}✗${NC} $1"; }
-print_info() { echo "  ${BLUE}→${NC} $1"; }
+# ------------------------------------------------------------------------------
+# draw_logo — full 6-line GOSTREAM ASCII logo (centered, used on splash + summary)
+# ------------------------------------------------------------------------------
+draw_logo() {
+    local cols; cols=$(get_cols)
+    local pad=$(( (cols - 72) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+    local sp; printf -v sp '%*s' "$pad" ''
+
+    echo ""
+    printf "%s%s██████╗  ██████╗ ███████╗████████╗██████╗ ███████╗ █████╗ ███╗   ███╗%s\n"  "$P2" "$sp" "$PRST"
+    printf "%s%s██╔════╝ ██╔═══██╗██╔════╝╚══██╔══╝██╔══██╗██╔════╝██╔══██╗████╗ ████║%s\n" "$P3" "$sp" "$PRST"
+    printf "%s%s██║  ███╗██║   ██║███████╗   ██║   ██████╔╝█████╗  ███████║██╔████╔██║%s\n"  "$P4" "$sp" "$PRST"
+    printf "%s%s██║   ██║██║   ██║╚════██║   ██║   ██╔══██╗██╔══╝  ██╔══██║██║╚██╔╝██║%s\n" "$P4" "$sp" "$PRST"
+    printf "%s%s╚██████╔╝╚██████╔╝███████║   ██║   ██║  ██║███████╗██║  ██║██║ ╚═╝ ██║%s\n" "$P3" "$sp" "$PRST"
+    printf "%s%s ╚═════╝  ╚═════╝ ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝%s\n" "$P2" "$sp" "$PRST"
+    echo ""
+    local payoff="✦  The Torrent Service  ✦"
+    local ppad=$(( (cols - ${#payoff}) / 2 ))
+    [ "$ppad" -lt 0 ] && ppad=0
+    printf "%*s%s%s%s\n" "$ppad" "" "$PSUB" "$payoff" "$PRST"
+    echo ""
+    echo ""
+}
+
+# ------------------------------------------------------------------------------
+# draw_header — compact 1-line brand strip for wizard/install screens
+# ------------------------------------------------------------------------------
+draw_header() {
+    local cols; cols=$(get_cols)
+    local brand="  G O S T R E A M  ✦  The Torrent Service · Installer"
+    local bp=$(( (cols - ${#brand}) / 2 ))
+    [ "$bp" -lt 0 ] && bp=0
+    printf "\n%*s%s%s%s%s\n" "$bp" "" "$P4$BOLD" "$brand" "$NC$PRST"
+    print_hr "$PDIM"
+}
+
+# ------------------------------------------------------------------------------
+# wizard_header — clears screen, draws compact header + phase progress bar
+# Usage: wizard_header "Phase Title" current_step total_steps
+# ------------------------------------------------------------------------------
+wizard_header() {
+    local title="$1" step="${2:-1}" total="${3:-3}"
+    local cols; cols=$(get_cols)
+    local msg
+    [ "$step" -lt "$total" ] && msg=$(pick_msg _MSGS_SETUP) || msg=$(pick_msg _MSGS_WORK)
+
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    draw_logo
+
+    local bar_w=$(( cols - 16 ))
+    local filled=$(( bar_w * step / total ))
+    local empty=$(( bar_w - filled ))
+    printf "  %s" "$P3"
+    local _i; for ((_i=0; _i<filled; _i++)); do printf "█"; done
+    printf "%s" "$PDIM"
+    for ((_i=0; _i<empty; _i++)); do printf "░"; done
+    printf "%s  %sPhase %d/%d%s\n" "$PRST" "$PSUB" "$step" "$total" "$PRST"
+    echo ""
+    printf "  %s%s◆  %s%s\n" "$PTEAL" "$BOLD" "$title" "$NC$PRST"
+    echo ""
+    printf "  %s%s%s\n" "$PSUB" "$msg" "$PRST"
+    print_hr "$PDIM"
+    echo ""
+}
+
+# ------------------------------------------------------------------------------
+# Helper: print a colored section header (full-width separator, no clear)
+# ------------------------------------------------------------------------------
+print_header() {
+    echo ""
+    printf "  %s%s◆  %s%s%s\n" "$PTEAL" "$BOLD" "$1" "$NC" "$PRST"
+    print_hr "$PDIM"
+    echo ""
+}
+
+print_ok()   { printf "  %s✔%s  %s\n" "$PGRN"  "$PRST" "$1"; }
+print_warn() { printf "  %s⚠%s   %s\n" "$PYLW"  "$PRST" "$1"; }
+print_err()  { printf "  %s✘%s  %s\n" "$PRED"  "$PRST" "$1"; }
+print_info() { printf "  %s→%s  %s\n" "$PTEAL" "$PRST" "$1"; }
 
 # ------------------------------------------------------------------------------
 # Helper: ask "Prompt" "default" VAR_NAME
 #   Displays [default] hint; if user presses Enter, uses default.
 # ------------------------------------------------------------------------------
 ask() {
-    local prompt="$1"
-    local default="$2"
-    local var_name="$3"
-    local user_input
+    local prompt="$1" default="$2" var_name="$3" user_input
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
 
+    echo ""
+    printf "%s%s%s%s\n" "$sp" "$BOLD" "$prompt" "$NC"
     if [ -n "$default" ]; then
-        printf "  %s [%s]: " "$prompt" "$default"
-    else
-        printf "  %s: " "$prompt"
+        printf "%s%sDefault:%s %s\n" "$sp" "$PSUB" "$PRST" "$default"
     fi
-
+    printf "%s%s❯%s " "$sp" "$P4" "$PRST"
     read -r user_input
-    if [ -z "$user_input" ]; then
-        user_input="$default"
-    fi
-    # Assign to the caller's variable by name
+    [ -z "$user_input" ] && user_input="$default"
     printf -v "$var_name" '%s' "$user_input"
 }
 
@@ -68,13 +248,16 @@ ask() {
 #   Hidden input (no echo); no default shown for security.
 # ------------------------------------------------------------------------------
 ask_secret() {
-    local prompt="$1"
-    local var_name="$2"
-    local user_input
+    local prompt="$1" var_name="$2" user_input
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
 
-    printf "  %s: " "$prompt"
+    echo ""
+    printf "%s%s%s%s\n" "$sp" "$BOLD" "$prompt" "$NC"
+    printf "%s%s(hidden input)%s\n" "$sp" "$PSUB" "$PRST"
+    printf "%s%s❯%s " "$sp" "$P4" "$PRST"
     read -rs user_input
-    echo ""  # newline after hidden input
+    echo ""
     printf -v "$var_name" '%s' "$user_input"
 }
 
@@ -84,22 +267,22 @@ ask_secret() {
 #   default_yn should be "y" or "n" (case-insensitive).
 # ------------------------------------------------------------------------------
 ask_yn() {
-    local question="$1"
-    local default="${2:-n}"
-    local hint user_input
+    local question="$1" default="${2:-n}" hint user_input
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
 
     if [ "${default,,}" = "y" ]; then
-        hint="Y/n"
+        hint="${PGRN}${BOLD}Yes${NC}${PRST}  ${PDIM}/  No${PRST}  ${PSUB}(recommended: Yes)${PRST}"
     else
-        hint="y/N"
+        hint="${PDIM}Yes  /${PRST}  ${PRED}${BOLD}No${NC}${PRST}  ${PSUB}(recommended: No)${PRST}"
     fi
 
-    printf "  %s [%s]: " "$question" "$hint"
+    echo ""
+    printf "%s%s%s%s\n" "$sp" "$BOLD" "$question" "$NC"
+    printf "%s%s%s\n" "$sp" "$hint" "$PRST"
+    printf "%s%s❯%s " "$sp" "$P4" "$PRST"
     read -r user_input
-
-    if [ -z "$user_input" ]; then
-        user_input="$default"
-    fi
+    [ -z "$user_input" ] && user_input="$default"
 
     case "${user_input,,}" in
         y|yes) return 0 ;;
@@ -108,18 +291,26 @@ ask_yn() {
 }
 
 # ------------------------------------------------------------------------------
-# ASCII Banner
+# show_banner — full-screen splash (clears terminal, waits for Enter)
 # ------------------------------------------------------------------------------
 show_banner() {
+    local cols; cols=$(get_cols)
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+
+    draw_logo
+
     echo ""
-    echo "${BOLD}${BLUE}╔══════════════════════════════════════╗${NC}"
-    echo "${BOLD}${BLUE}║          GoStream Installer          ║${NC}"
-    echo "${BOLD}${BLUE}╚══════════════════════════════════════╝${NC}"
+    print_hr "$PDIM"
+    printf "  %sPlatform%s  $(uname -m) / $(uname -s)   %s│%s  Samba (optional) · built-in scheduler · FUSE\n" \
+        "$PTEAL" "$PRST" "$PDIM" "$PRST"
+    print_hr "$PDIM"
     echo ""
-    echo "  GoStream + GoStorm — Unified BitTorrent + FUSE Streaming Engine"
-    echo "  Target:         $(uname -m) / $(uname -s), 24/7 production"
-    echo "  Includes:       cron setup, sudoers, Plex webhook guide"
-    echo ""
+
+    local hint="  Press Enter to begin installation  "
+    local hpad=$(( (cols - ${#hint}) / 2 ))
+    [ "$hpad" -lt 0 ] && hpad=0
+    printf "%*s%s%s%s\n\n" "$hpad" "" "$PSUB" "$hint" "$PRST"
+    read -r
 }
 
 # ==============================================================================
@@ -129,7 +320,10 @@ install_system_deps() {
     # Only run on Debian/Ubuntu-based systems
     if ! command -v apt-get >/dev/null 2>&1; then
         print_warn "apt-get not found — skipping automatic dependency installation."
-        print_warn "Please install manually: git python3-pip fuse3 curl samba"
+        print_warn "Please install manually: git fuse3 curl"
+        if [ "${INSTALL_SAMBA:-true}" = "true" ]; then
+            print_warn "Samba: samba"
+        fi
         return 0
     fi
 
@@ -137,10 +331,12 @@ install_system_deps() {
     local -A needed=()
 
     command -v git         >/dev/null 2>&1 || needed["git"]="git"
-    command -v pip3        >/dev/null 2>&1 || needed["pip3"]="python3-pip"
     command -v fusermount3 >/dev/null 2>&1 || needed["fusermount3"]="fuse3"
     command -v curl        >/dev/null 2>&1 || needed["curl"]="curl"
-    command -v samba       >/dev/null 2>&1 || needed["samba"]="samba"
+    # Samba is optional — only check if user wants it
+    if [ "${INSTALL_SAMBA:-true}" = "true" ]; then
+        dpkg -s samba        >/dev/null 2>&1 || needed["samba"]="samba"
+    fi
     # libfuse3-dev is required for CGO_ENABLED=1 compilation (provides fuse.h)
     dpkg -s libfuse3-dev   >/dev/null 2>&1 || needed["libfuse3-dev"]="libfuse3-dev"
     # gcc is required for CGO
@@ -180,32 +376,6 @@ check_prerequisites() {
 
     local all_ok=true
 
-    # python3 >= 3.9
-    if command -v python3 >/dev/null 2>&1; then
-        local py_ver
-        py_ver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-        local py_major py_minor
-        py_major=$(echo "$py_ver" | cut -d. -f1)
-        py_minor=$(echo "$py_ver" | cut -d. -f2)
-        if [ "$py_major" -gt 3 ] || { [ "$py_major" -eq 3 ] && [ "$py_minor" -ge 9 ]; }; then
-            print_ok "python3 ($py_ver)"
-        else
-            print_err "python3 found but version $py_ver < 3.9 (required)"
-            all_ok=false
-        fi
-    else
-        print_err "python3 not found (required)"
-        all_ok=false
-    fi
-
-    # pip3
-    if command -v pip3 >/dev/null 2>&1; then
-        print_ok "pip3"
-    else
-        print_err "pip3 not found (required for Python dependencies)"
-        all_ok=false
-    fi
-
     # fusermount3 or fusermount (FUSE userspace tool)
     if command -v fusermount3 >/dev/null 2>&1; then
         print_ok "fusermount3"
@@ -241,13 +411,13 @@ check_prerequisites() {
 }
 
 # ==============================================================================
-# [1/5] System Paths
+# [1/3] System Paths + User/Group
 # ==============================================================================
 collect_paths() {
-    print_header "[1/5] System Paths"
+    wizard_header "[1/3] System Paths" 1 3
 
-    # V1.4.6: Auto-detect current directory, user and group for a seamless 'press-enter' experience
-    local default_install_dir="${SCRIPT_DIR}"
+    # Default: GoStream subdirectory next to the installer
+    local default_install_dir="${SCRIPT_DIR}/GoStream"
     local default_user
     default_user=$(whoami)
     local default_group
@@ -259,163 +429,40 @@ collect_paths() {
     ask "System user that owns GoStream" "$default_user" SYSTEM_USER
     ask "System group" "$default_group" SYSTEM_GROUP
 
-    # Derive BASE_DIR as INSTALL_DIR (V1.4.6: logs/ and STATE/ are now inside)
+    # Resolve to absolute path
+    INSTALL_DIR="$(cd "$(dirname "${INSTALL_DIR}")" 2>/dev/null && pwd)/$(basename "${INSTALL_DIR}")" || INSTALL_DIR="$(pwd)/${INSTALL_DIR}"
+    mkdir -p "${INSTALL_DIR}"
+
+    # Derive BASE_DIR as INSTALL_DIR
     BASE_DIR="${INSTALL_DIR}"
 
+    # Centered confirmation summary
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
     echo ""
-    print_info "Derived base directory : ${BASE_DIR}"
-    print_info "Logs directory         : ${BASE_DIR}/logs/"
-    print_info "State directory        : ${BASE_DIR}/STATE/"
+    printf "%s%s✔  Paths confirmed%s\n" "$sp" "$PGRN" "$PRST"
+    printf "%s%s   Install dir   :%s %s\n" "$sp" "$PDIM" "$PRST" "$INSTALL_DIR"
+    printf "%s%s   Source path   :%s %s\n" "$sp" "$PDIM" "$PRST" "$STORAGE_PATH"
+    printf "%s%s   FUSE mount    :%s %s\n" "$sp" "$PDIM" "$PRST" "$FUSE_MOUNT"
 }
 
 # ==============================================================================
-# [2/5] Plex Configuration
+# [2/3] Samba (optional)
 # ==============================================================================
-collect_plex() {
-    print_header "[2/5] Plex Configuration"
+collect_options() {
+    wizard_header "[2/3] Options" 2 3
 
-    ask       "Plex server URL"  "http://127.0.0.1:32400" PLEX_URL
-    ask_secret "Plex token (hidden)" PLEX_TOKEN
-
-    PLEX_LIBRARY_ID=0
-    PLEX_TV_LIBRARY_ID=0
-
-    # Auto-discover library sections if we have curl and a non-empty token
-    if [ -n "$PLEX_TOKEN" ] && command -v curl >/dev/null 2>&1; then
+    INSTALL_SAMBA=true
+    local pad; pad=$(form_pad)
+    local sp; printf -v sp '%*s' "$pad" ''
+    if ask_yn "Install and configure Samba?" "y"; then
+        INSTALL_SAMBA=true
         echo ""
-        print_info "Querying Plex for library sections..."
-        local sections_xml
-        if sections_xml=$(curl -sf --max-time 8 \
-                "${PLEX_URL}/library/sections?X-Plex-Token=${PLEX_TOKEN}" 2>/dev/null); then
-            # Parse XML with python3: extract (key, title, type) via env var to avoid stdin conflict
-            local parsed
-            parsed=$(PLEX_SECTIONS_XML="$sections_xml" python3 <<'PYEOF'
-import os, xml.etree.ElementTree as ET, sys
-
-xml_text = os.environ.get('PLEX_SECTIONS_XML', '')
-try:
-    root = ET.fromstring(xml_text)
-except ET.ParseError as e:
-    print(f"XML_PARSE_ERROR:{e}", file=sys.stderr)
-    sys.exit(1)
-
-sections = []
-for directory in root.findall('Directory'):
-    lib_type = directory.get('type', '')
-    if lib_type in ('movie', 'show'):
-        key = directory.get('key', '')
-        title = directory.get('title', '(unknown)')
-        sections.append(f"{key}:{title}:{lib_type}")
-
-print('\n'.join(sections))
-PYEOF
-) || true
-
-            if [ -n "$parsed" ]; then
-                echo ""
-                echo "  Available Plex libraries:"
-                local i=1
-                local -a lib_keys lib_titles lib_types
-                while IFS= read -r line; do
-                    local key title lib_type
-                    key="${line%%:*}"
-                    rest="${line#*:}"
-                    lib_type="${rest##*:}"
-                    title="${rest%:*}"
-                    lib_keys+=("$key")
-                    lib_titles+=("$title")
-                    lib_types+=("$lib_type")
-                    printf "    %d) [%s] %s (%s)\n" "$i" "$key" "$title" "$lib_type"
-                    (( i++ )) || true
-                done <<< "$parsed"
-
-                echo ""
-                ask "Movies library number (0 to enter manually)" "0" _movies_choice
-                if [ "$_movies_choice" -gt 0 ] 2>/dev/null && \
-                   [ "$_movies_choice" -le "${#lib_keys[@]}" ] 2>/dev/null; then
-                    local idx=$(( _movies_choice - 1 ))
-                    PLEX_LIBRARY_ID="${lib_keys[$idx]}"
-                    print_ok "Movies library: ${lib_titles[$idx]} (ID: ${PLEX_LIBRARY_ID})"
-                else
-                    ask "Movies library ID (numeric)" "1" PLEX_LIBRARY_ID
-                fi
-
-                ask "TV library number (0 to enter manually, 0 if none)" "0" _tv_choice
-                if [ "$_tv_choice" -gt 0 ] 2>/dev/null && \
-                   [ "$_tv_choice" -le "${#lib_keys[@]}" ] 2>/dev/null; then
-                    local idx=$(( _tv_choice - 1 ))
-                    PLEX_TV_LIBRARY_ID="${lib_keys[$idx]}"
-                    print_ok "TV library: ${lib_titles[$idx]} (ID: ${PLEX_TV_LIBRARY_ID})"
-                else
-                    ask "TV library ID (numeric, 0 to skip)" "0" PLEX_TV_LIBRARY_ID
-                fi
-            else
-                print_warn "No movie/TV libraries found — entering manually."
-                ask "Movies library ID (numeric)" "1" PLEX_LIBRARY_ID
-                ask "TV library ID (numeric, 0 to skip)" "0" PLEX_TV_LIBRARY_ID
-            fi
-        else
-            print_warn "Could not reach Plex at ${PLEX_URL} — entering library IDs manually."
-            ask "Movies library ID (numeric)" "1" PLEX_LIBRARY_ID
-            ask "TV library ID (numeric, 0 to skip)" "0" PLEX_TV_LIBRARY_ID
-        fi
+        printf "%s%s✔  Samba will be installed and configured.%s\n" "$sp" "$PGRN" "$PRST"
     else
-        if [ -z "$PLEX_TOKEN" ]; then
-            print_warn "No Plex token provided — skipping auto-discovery."
-        fi
-        ask "Movies library ID (numeric)" "1" PLEX_LIBRARY_ID
-        ask "TV library ID (numeric, 0 to skip)" "0" PLEX_TV_LIBRARY_ID
-    fi
-}
-
-# ==============================================================================
-# [3/5] External APIs
-# ==============================================================================
-collect_apis() {
-    print_header "[3/5] External APIs"
-
-    ask "TMDB API key (optional — leave empty to skip movie sync)" "" TMDB_API_KEY
-
-    if [ -z "$TMDB_API_KEY" ]; then
-        print_warn "No TMDB key entered. Movie sync (gostorm-sync-complete.py) will not function."
-    else
-        print_ok "TMDB API key set."
-    fi
-}
-
-# ==============================================================================
-# [4/5] Hardware & Network
-# ==============================================================================
-collect_hardware() {
-    print_header "[4/5] Hardware & Network"
-
-    ask "GOMEMLIMIT (MiB)  — 2200 is optimal for Pi 4 / 4GB" "2200" GOMEMLIMIT_MB
-
-    ask "Proxy listen port        (proxy_listen_port)" "8080" PROXY_PORT
-    ask "Metrics/dashboard port   (metrics_port)"      "8096" METRICS_PORT
-    ask "Health monitor port      (health-monitor.py)" "8095" DASHBOARD_PORT
-
-    # NAT-PMP
-    echo ""
-    NATPMP_ENABLED=false
-    NATPMP_GATEWAY=""
-    VPN_INTERFACE="wg0"
-
-    if ask_yn "Enable NAT-PMP (WireGuard port forwarding)?" "n"; then
-        NATPMP_ENABLED=true
-        ask "NAT-PMP gateway IP" "" NATPMP_GATEWAY
-        ask "VPN interface" "wg0" VPN_INTERFACE
-        print_ok "NAT-PMP enabled (gateway: ${NATPMP_GATEWAY}, interface: ${VPN_INTERFACE})"
-    else
-        print_info "NAT-PMP disabled."
+        INSTALL_SAMBA=false
         echo ""
-        print_warn "Without NAT-PMP/WireGuard, all BitTorrent traffic (DHT, peer"
-        print_warn "connections, tracker queries) flows directly through your home"
-        print_warn "router. This can saturate the router's NAT connection-tracking"
-        print_warn "table, causing instability or reboots on some devices."
-        print_warn "Recommended: keep ConnectionsLimit <= 25 and enable WireGuard"
-        print_warn "on the Pi before running GoStream in production."
-        echo ""
+        printf "%s%s→  Samba skipped — configure an alternative access method post-install.%s\n" "$sp" "$PSUB" "$PRST"
     fi
 }
 
@@ -427,235 +474,131 @@ collect_hardware() {
 # 5a. Generate config.json from config.json.example
 # ------------------------------------------------------------------------------
 generate_config_json() {
+    step_start "Generate config.json"
     local output_path="${INSTALL_DIR}/config.json"
-
-    # Ensure INSTALL_DIR exists before writing anything
-    mkdir -p "${INSTALL_DIR}"
-
-    # Look for config.json.example: first in the repo (SCRIPT_DIR), then in INSTALL_DIR
-    local example_path
-    if [ -f "${SCRIPT_DIR}/config.json.example" ]; then
-        example_path="${SCRIPT_DIR}/config.json.example"
-    else
-        example_path="${INSTALL_DIR}/config.json.example"
-    fi
-
-    print_info "Generating config.json..."
+    local example_path="${INSTALL_DIR}/config.json.example"
 
     if [ ! -f "$example_path" ]; then
-        print_warn "config.json.example not found — using built-in template."
-        example_path="${INSTALL_DIR}/config.json.example"
-        mkdir -p "${INSTALL_DIR}"
-        # Write the embedded template so the python script below can update it
-        cat > "$example_path" <<'TEMPLATE_EOF'
-{
-  "master_concurrency_limit": 25,
-  "read_ahead_budget_mb": 256,
-  "metadata_cache_size_mb": 50,
-  "write_buffer_size_kb": 64,
-  "read_buffer_size_kb": 1024,
-  "fuse_block_size_bytes": 1048576,
-  "streaming_threshold_kb": 128,
-  "log_level": "INFO",
-  "attr_timeout_seconds": 1,
-  "entry_timeout_seconds": 1,
-  "negative_timeout_seconds": 0,
-  "http_client_timeout_seconds": 30,
-  "max_retry_attempts": 6,
-  "retry_delay_ms": 500,
-  "rescue_grace_period_seconds": 240,
-  "rescue_cooldown_hours": 24,
-  "preload_workers_count": 4,
-  "preload_initial_delay_ms": 1000,
-  "warm_start_idle_seconds": 6,
-  "max_concurrent_prefetch": 3,
-  "cache_cleanup_interval_min": 5,
-  "max_cache_entries": 10000,
-  "gostorm_url": "http://127.0.0.1:8090",
-  "proxy_listen_port": 8080,
-  "metrics_port": 8096,
-  "blocklist_url": "https://github.com/Naunter/BT_BlockLists/raw/master/bt_blocklists.gz",
-  "physical_source_path": "/mnt/gostream-mkv-real",
-  "fuse_mount_path": "/mnt/gostream-mkv-virtual",
-  "disk_warmup_quota_gb": 12,
-  "warmup_head_size_mb": 64,
-  "natpmp": {
-    "enabled": false,
-    "gateway": "",
-    "local_port": 8091,
-    "vpn_interface": "wg0",
-    "lifetime": 60,
-    "refresh": 45
-  },
-  "plex": {
-    "url": "http://127.0.0.1:32400",
-    "token": "",
-    "library_id": 0,
-    "tv_library_id": 0
-  },
-  "tmdb_api_key": "",
-  "prowlarr": {
-    "enabled": false,
-    "api_key": "",
-    "url": ""
-  }
-}
-TEMPLATE_EOF
+        print_err "config.json.example not found — cannot generate config."
+        exit 1
     fi
 
-    # Use python3 to safely read JSON, update fields, and write output
-    python3 - <<PYEOF
-import json, sys
-
-example_path = "${example_path}"
-output_path  = "${output_path}"
-
-with open(example_path, 'r') as fh:
-    cfg = json.load(fh)
-
-# --- Paths ---
-cfg['physical_source_path'] = "${STORAGE_PATH}"
-cfg['fuse_mount_path']       = "${FUSE_MOUNT}"
-
-# --- Network ---
-cfg['proxy_listen_port'] = int("${PROXY_PORT}")
-cfg['metrics_port']      = int("${METRICS_PORT}")
-
-# --- External APIs ---
-if "${TMDB_API_KEY}":
-    cfg['tmdb_api_key'] = "${TMDB_API_KEY}"
-
-# --- Plex block ---
-if 'plex' not in cfg or not isinstance(cfg.get('plex'), dict):
-    cfg['plex'] = {}
-cfg['plex']['url']        = "${PLEX_URL}"
-cfg['plex']['token']      = "${PLEX_TOKEN}"
-try:
-    cfg['plex']['library_id'] = int("${PLEX_LIBRARY_ID}")
-except ValueError:
-    cfg['plex']['library_id'] = 0
-try:
-    cfg['plex']['tv_library_id'] = int("${PLEX_TV_LIBRARY_ID}")
-except ValueError:
-    cfg['plex']['tv_library_id'] = 0
-
-# --- NAT-PMP block ---
-if 'natpmp' not in cfg or not isinstance(cfg.get('natpmp'), dict):
-    cfg['natpmp'] = {
-        "local_port": 8091,
-        "lifetime": 60,
-        "refresh": 45
-    }
-natpmp_enabled_str = "${NATPMP_ENABLED}"
-cfg['natpmp']['enabled']       = natpmp_enabled_str.lower() == 'true'
-cfg['natpmp']['gateway']       = "${NATPMP_GATEWAY}"
-cfg['natpmp']['vpn_interface'] = "${VPN_INTERFACE}"
-
-with open(output_path, 'w') as fh:
-    json.dump(cfg, fh, indent=2)
-    fh.write('\n')
-
-print(f"  Written: {output_path}")
-PYEOF
+    # Copy the example and patch only the path fields with sed
+    cp "$example_path" "$output_path"
+    sed -i "s|\"physical_source_path\": \".*\"|\"physical_source_path\": \"${STORAGE_PATH}\"|" "$output_path"
+    sed -i "s|\"fuse_mount_path\": \".*\"|\"fuse_mount_path\": \"${FUSE_MOUNT}\"|" "$output_path"
 
     print_ok "config.json written to ${output_path}"
+    print_info "Configure Plex, TMDB, NAT-PMP, ports, and scheduler from the Control Panel at :9080/control"
 }
 
 # ------------------------------------------------------------------------------
-# 5a2. Deploy files from repo to INSTALL_DIR
+# 5a. Clone or use existing repo source
+# ------------------------------------------------------------------------------
+clone_repo() {
+    step_start "Clone / copy source"
+
+    # Check if this is already a cloned repo (main.go exists in SCRIPT_DIR)
+    if [ -f "${SCRIPT_DIR}/main.go" ]; then
+        # If INSTALL_DIR is inside SCRIPT_DIR (e.g. SCRIPT_DIR=/home/pi, INSTALL_DIR=/home/pi/GoStream),
+        # don't rsync the entire parent directory — clone fresh instead
+        case "${INSTALL_DIR}" in
+            "${SCRIPT_DIR}"/*)
+                print_info "Install directory is inside source directory — cloning fresh from GitHub..."
+                ;;
+            *)
+                if [ "$(realpath "${SCRIPT_DIR}")" != "$(realpath "${INSTALL_DIR}")" ]; then
+                    print_info "Copying source to ${INSTALL_DIR}..."
+                    rsync -a "${SCRIPT_DIR}/" "${INSTALL_DIR}/" --exclude='.git'
+                    print_ok "Source copied to ${INSTALL_DIR}"
+                    return 0
+                fi
+                print_ok "Source found in ${SCRIPT_DIR} — using existing clone."
+                return 0
+                ;;
+        esac
+    fi
+
+    # Clone from GitHub
+    local repo_url="https://github.com/MrRobotoGit/gostream.git"
+    local tmp_clone="/tmp/gostream-clone-$$"
+
+    print_info "Cloning source from GitHub..."
+    if command -v git >/dev/null 2>&1; then
+        git clone --depth 1 "$repo_url" "$tmp_clone"
+        mkdir -p "${INSTALL_DIR}"
+        rsync -a "${tmp_clone}/" "${INSTALL_DIR}/"
+        rm -rf "$tmp_clone"
+
+        # Remove committed Go module cache (causes go mod tidy errors)
+        if [ -d "${INSTALL_DIR}/go/pkg/mod" ]; then
+            rm -rf "${INSTALL_DIR}/go/pkg/mod"
+        fi
+
+        print_ok "Source cloned to ${INSTALL_DIR}"
+    else
+        print_err "git not found — cannot clone source."
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 5a2. Deploy config.json.example
 # ------------------------------------------------------------------------------
 deploy_files() {
+    step_start "Deploy config.json.example"
     print_info "Deploying files to ${INSTALL_DIR}..."
 
-    mkdir -p "${INSTALL_DIR}/scripts"
+    # Ensure INSTALL_DIR exists
+    mkdir -p "${INSTALL_DIR}"
 
-    # Copy scripts
-    if [ -d "${SCRIPT_DIR}/scripts" ]; then
-        cp -r "${SCRIPT_DIR}/scripts/." "${INSTALL_DIR}/scripts/"
-        print_ok "Scripts deployed to ${INSTALL_DIR}/scripts/"
+    # config.json.example should already be in INSTALL_DIR from clone_repo
+    if [ -f "${INSTALL_DIR}/config.json.example" ]; then
+        print_ok "config.json.example present in ${INSTALL_DIR}/"
     else
-        print_warn "scripts/ directory not found in ${SCRIPT_DIR} — skipping."
-    fi
-
-    # Copy config.json.example (useful reference for the user)
-    if [ -f "${SCRIPT_DIR}/config.json.example" ]; then
-        cp "${SCRIPT_DIR}/config.json.example" "${INSTALL_DIR}/config.json.example"
-        print_ok "config.json.example deployed to ${INSTALL_DIR}/"
-    fi
-
-    # Copy requirements.txt
-    if [ -f "${SCRIPT_DIR}/requirements.txt" ]; then
-        cp "${SCRIPT_DIR}/requirements.txt" "${INSTALL_DIR}/requirements.txt"
-        print_ok "requirements.txt deployed to ${INSTALL_DIR}/"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# 5b. Install Python dependencies
-# ------------------------------------------------------------------------------
-install_python_deps() {
-    local req_file="${INSTALL_DIR}/requirements.txt"
-
-    print_info "Installing Python dependencies..."
-
-    # --break-system-packages is required on Debian 12+ / Raspberry Pi OS Bookworm
-    # This is intentional: the Pi is a single-purpose server, not a shared system.
-    local pip_flags="--quiet --break-system-packages --no-warn-script-location"
-
-    if [ -f "$req_file" ]; then
-        pip3 install -r "$req_file" $pip_flags
-        print_ok "Python dependencies installed from requirements.txt"
-    else
-        # Install the known runtime dependencies directly
-        print_warn "requirements.txt not found — installing known dependencies."
-        pip3 install $pip_flags \
-            requests \
-            psutil \
-            "fastapi>=0.100.0" \
-            "uvicorn[standard]"
-        print_ok "Core Python packages installed (requests, psutil, fastapi, uvicorn)"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# 5c. Create directories
-# ------------------------------------------------------------------------------
-create_directories() {
-    print_info "Creating required directories..."
-
-    # Directories that belong to the system user (no sudo needed if running as that user)
-    local user_dirs=(
-        "${BASE_DIR}/STATE"
-        "${BASE_DIR}/logs"
-    )
-
-    for d in "${user_dirs[@]}"; do
-        if mkdir -p "$d" 2>/dev/null; then
-            print_ok "Created: $d"
-        elif sudo mkdir -p "$d"; then
-            sudo chown "${SYSTEM_USER}:${SYSTEM_USER}" "$d"
-            print_ok "Created (sudo): $d"
+        print_info "config.json.example not found — downloading from GitHub..."
+        local raw_url="https://raw.githubusercontent.com/MrRobotoGit/gostream/refs/heads/main/config.json.example"
+        if curl -sfL -o "${INSTALL_DIR}/config.json.example" "$raw_url"; then
+            print_ok "config.json.example downloaded from GitHub"
         else
-            print_err "Failed to create: $d"
+            print_err "Failed to download config.json.example from GitHub."
             exit 1
         fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 5b. Create directories
+# ------------------------------------------------------------------------------
+create_directories() {
+    step_start "Create directories"
+
+    # Directories inside INSTALL_DIR (user-writable)
+    local local_dirs=(
+        "${INSTALL_DIR}/STATE"
+        "${INSTALL_DIR}/logs"
+    )
+
+    for d in "${local_dirs[@]}"; do
+        mkdir -p "$d"
+        print_ok "Created: $d"
     done
 
-    # Directories under /mnt may require sudo
-    local root_dirs=(
+    # Data directories (MKV source + FUSE mount point — may need sudo)
+    local data_dirs=(
         "${STORAGE_PATH}/movies"
         "${STORAGE_PATH}/tv"
         "${FUSE_MOUNT}"
     )
 
-    for d in "${root_dirs[@]}"; do
+    for d in "${data_dirs[@]}"; do
         if mkdir -p "$d" 2>/dev/null; then
-            chown "${SYSTEM_USER}:${SYSTEM_USER}" "$d" 2>/dev/null || true
+            chown "${SYSTEM_USER}:${SYSTEM_GROUP}" "$d" 2>/dev/null || true
             print_ok "Created: $d"
         else
             print_info "Creating ${d} requires sudo..."
             sudo mkdir -p "$d"
-            sudo chown "${SYSTEM_USER}:${SYSTEM_USER}" "$d"
+            sudo chown "${SYSTEM_USER}:${SYSTEM_GROUP}" "$d"
             print_ok "Created (sudo): $d"
         fi
     done
@@ -665,24 +608,30 @@ create_directories() {
 # 5d. Install systemd service files
 # ------------------------------------------------------------------------------
 install_services() {
-    print_info "Installing systemd service files (requires sudo)..."
+    step_start "Install systemd service"
 
-    # -- gostream.service --
-    local wg_after=""
-    if [ "$NATPMP_ENABLED" = "true" ] && [ -n "$VPN_INTERFACE" ]; then
-        wg_after=" wg-quick@${VPN_INTERFACE}.service"
+    local samba_restart=""
+    if [ "$INSTALL_SAMBA" = "true" ]; then
+        samba_restart='
+# Allow gostream to stabilize, then restart Samba so it sees the FUSE mount
+ExecStartPost=/bin/sleep 2
+ExecStartPost=/usr/bin/sudo /bin/systemctl restart smbd'
+    else
+        samba_restart='
+# Allow gostream to stabilize
+ExecStartPost=/bin/sleep 2'
     fi
 
     sudo tee /etc/systemd/system/gostream.service > /dev/null <<SERVICE_EOF
 [Unit]
 Description=GoStream + GoStorm (Unified Streaming Engine)
-After=network-online.target systemd-resolved.service nss-lookup.target local-fs.target remote-fs.target${wg_after}
+After=network-online.target systemd-resolved.service nss-lookup.target local-fs.target remote-fs.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-# Memory tuning — GOMEMLIMIT=${GOMEMLIMIT_MB}MiB is optimal for Pi 4 / 4GB
-Environment=GOMEMLIMIT=${GOMEMLIMIT_MB}MiB
+# Memory tuning — GOMEMLIMIT=2200MiB is optimal for Pi 4 / 4GB
+Environment=GOMEMLIMIT=2200MiB
 Environment=GOGC=100
 
 Type=simple
@@ -699,11 +648,7 @@ ExecStartPre=-/usr/bin/${FUSERMOUNT_CMD} -uz ${FUSE_MOUNT}
 ExecStartPre=/bin/mkdir -p ${FUSE_MOUNT}
 
 # V1.4.6: Main binary — using --path . for true portability (STATE stays in WorkingDirectory)
-ExecStart=./gostream --path .
-
-# Allow gostream to stabilize, then restart Samba so it sees the FUSE mount
-ExecStartPost=/bin/sleep 2
-ExecStartPost=/usr/bin/sudo /bin/systemctl restart smbd
+ExecStart=${INSTALL_DIR}/gostream --path .${samba_restart}
 
 Restart=always
 RestartSec=10
@@ -722,67 +667,23 @@ WantedBy=multi-user.target
 SERVICE_EOF
 
     print_ok "Wrote /etc/systemd/system/gostream.service"
-
-    # -- health-monitor.service --
-    sudo tee /etc/systemd/system/health-monitor.service > /dev/null <<HEALTHSVC_EOF
-[Unit]
-Description=GoStorm Health Monitor Dashboard
-After=network.target gostream.service
-
-[Service]
-Type=simple
-User=${SYSTEM_USER}
-WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/bin/python3 scripts/health-monitor.py
-Restart=always
-RestartSec=5
-TimeoutStopSec=5
-Environment=PYTHONUNBUFFERED=1
-
-# Centralized logging for dashboard
-StandardOutput=append:logs/health-monitor.log
-StandardError=append:logs/health-monitor.log
-
-[Install]
-WantedBy=multi-user.target
-HEALTHSVC_EOF
-
-    print_ok "Wrote /etc/systemd/system/health-monitor.service"
 }
 
 # ------------------------------------------------------------------------------
 # 5e. Enable services via systemd
 # ------------------------------------------------------------------------------
 enable_services() {
+    step_start "Enable service"
     print_info "Reloading systemd and enabling services..."
 
     sudo systemctl daemon-reload
-    sudo systemctl enable gostream health-monitor
+    sudo systemctl enable gostream
 
-    print_ok "Services enabled: gostream, health-monitor"
+    print_ok "Services enabled: gostream"
 }
 
 # ------------------------------------------------------------------------------
-# 5f. Verify installation (non-fatal — binary may not be deployed yet)
-# ------------------------------------------------------------------------------
-verify_install() {
-    print_info "Verifying installation (checking metrics endpoint)..."
-
-    local url="http://127.0.0.1:${METRICS_PORT}/metrics"
-    if command -v curl >/dev/null 2>&1; then
-        if curl -sf --max-time 5 "$url" >/dev/null 2>&1; then
-            print_ok "GoStream metrics endpoint is reachable at ${url}"
-        else
-            print_warn "GoStream is not running yet (metrics endpoint not reachable)."
-            print_warn "This is expected if the binary has not been copied and started."
-        fi
-    else
-        print_warn "curl not available — skipping endpoint verification."
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# 5f2. Install Go toolchain if missing or wrong architecture
+# 5g. Sudoers entry so gostream.service can restart smbd without a password
 # ------------------------------------------------------------------------------
 GO_BIN=""
 GO_ARCH=""
@@ -869,12 +770,11 @@ ensure_swap() {
 }
 
 compile_binary() {
-    print_info "Compiling GoStream binary (this takes a few minutes on Pi 4)..."
-
+    step_start "Compile binary  (takes a few minutes on Pi 4)"
     ensure_go
     ensure_swap
 
-    local src_dir="${SCRIPT_DIR}"
+    local src_dir="${INSTALL_DIR}"
     local out_bin="${INSTALL_DIR}/gostream"
 
     # Verify we have Go source files in the expected location
@@ -884,6 +784,11 @@ compile_binary() {
     fi
 
     cd "${src_dir}"
+
+    # Clean Go module cache if committed (causes go mod tidy errors with @version paths)
+    if [ -d "${src_dir}/go/pkg/mod" ]; then
+        rm -rf "${src_dir}/go/pkg/mod"
+    fi
 
     print_info "Running go mod tidy..."
     GOTOOLCHAIN=local "$GO_BIN" mod tidy
@@ -901,9 +806,68 @@ compile_binary() {
     # GOTMPDIR on the main FS avoids OOM on small /tmp tmpfs during linking
     local go_tmp="${HOME}/go-tmp"
     mkdir -p "${go_tmp}"
+
+    # Embed version: try local git tag first, then GitHub API, then version.go
+    local app_version
+    app_version=$(git describe --tags --abbrev=0 2>/dev/null || true)
+
+    if [ -z "$app_version" ] && command -v curl >/dev/null 2>&1; then
+        app_version=$(curl -fsSL --max-time 5 \
+            "https://api.github.com/repos/MrRobotoGit/gostream/releases/latest" \
+            2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    fi
+
+    local ldflags=""
+    if [ -n "$app_version" ]; then
+        ldflags="-X main.AppVersion=${app_version}"
+        print_info "Embedding version: ${app_version}"
+    else
+        print_info "No version tag found — using hardcoded version from version.go"
+    fi
+
     print_info "Building binary (GOARCH=${GO_ARCH}, -p 2)..."
+
+    # Spinner during go build (runs in background, main shell polls)
+    _spinner_pid=""
+    _spinner() {
+        local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        local msgs=(
+            "Compiling... grab a coffee, you deserve it."
+            "Still going... the Pi is doing its best, okay?"
+            "Linking... almost there. Probably."
+            "Building... this is why they invented coffee breaks."
+        )
+        local i=0 m=0 tick=0
+        while true; do
+            local frame="${frames[$(( i % ${#frames[@]} ))]}"
+            local msg="${msgs[$(( m % ${#msgs[@]} ))]}"
+            printf "\r  %s%s%s  %s%s%s" "$P4" "$frame" "$PRST" "$PSUB" "$msg" "$PRST"
+            sleep 0.1
+            (( i++ )) || true
+            (( tick++ )) || true
+            # rotate message every ~4 seconds (40 ticks)
+            if (( tick % 40 == 0 )); then (( m++ )) || true; fi
+        done
+    }
+    _spinner &
+    _spinner_pid=$!
+
+    local _build_exit=0
     GOTOOLCHAIN=local GOARCH="${GO_ARCH}" CGO_ENABLED=1 GOTMPDIR="${go_tmp}" \
-        "$GO_BIN" build ${pgo_flag} -p 2 -o "${out_bin}" .
+        "$GO_BIN" build ${pgo_flag} -p 2 ${ldflags:+-ldflags "${ldflags}"} -o "${out_bin}" . \
+        2>/tmp/gostream_build.log || _build_exit=$?
+
+    # Kill spinner and clear the spinner line
+    kill "$_spinner_pid" 2>/dev/null; wait "$_spinner_pid" 2>/dev/null || true
+    printf "\r%*s\r" "$(get_cols)" ""   # erase spinner line
+
+    if [ "$_build_exit" -ne 0 ]; then
+        print_err "Build failed. Log:"
+        cat /tmp/gostream_build.log >&2
+        rm -f /tmp/gostream_build.log
+        exit "$_build_exit"
+    fi
+    rm -f /tmp/gostream_build.log
     rm -rf "${go_tmp}"
 
     chmod +x "${out_bin}"
@@ -913,9 +877,48 @@ compile_binary() {
 }
 
 # ------------------------------------------------------------------------------
-# 5g. Sudoers entry so gostream.service can restart smbd without a password
+# 5h. Verify installation (non-fatal — binary may not be deployed yet)
+# ------------------------------------------------------------------------------
+verify_install() {
+    step_start "Verify installation"
+
+    local url="http://127.0.0.1:9080/metrics"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -sf --max-time 5 "$url" >/dev/null 2>&1; then
+            print_ok "GoStream metrics endpoint is reachable at ${url}"
+        else
+            print_warn "GoStream is not running yet (metrics endpoint not reachable)."
+            print_warn "This is expected — start with: sudo systemctl start gostream"
+        fi
+    else
+        print_warn "curl not available — skipping endpoint verification."
+    fi
+
+    # 100% step bar + brief pause before summary screen
+    local cols; cols=$(get_cols)
+    local bar_w=$(( cols - 16 ))
+    echo ""
+    printf "  %s" "$PGRN"
+    local _i; for ((_i=0; _i<bar_w; _i++)); do printf "▓"; done
+    printf "%s  %s%s9/9  100%%%s\n" "$PRST" "$PGRN" "$BOLD" "$PRST$NC"
+    echo ""
+    local done_hint="  All done! Loading summary...  "
+    local dp=$(( (cols - ${#done_hint}) / 2 ))
+    [ "$dp" -lt 0 ] && dp=0
+    printf "%*s%s%s%s\n" "$dp" "" "$PSUB" "$done_hint" "$PRST"
+    sleep 1
+}
+
+# ------------------------------------------------------------------------------
+# Sudoers entry so gostream.service can restart smbd without a password
 # ------------------------------------------------------------------------------
 setup_sudoers() {
+    step_start "Configure sudoers"
+    if [ "$INSTALL_SAMBA" != "true" ]; then
+        print_info "Samba not installed — skipping sudoers entry."
+        return 0
+    fi
+
     print_info "Configuring sudoers for smbd restart..."
 
     local sudoers_file="/etc/sudoers.d/gostream-smbd"
@@ -937,122 +940,107 @@ setup_sudoers() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# 5h. Cron jobs for sync scripts (optional)
-# ------------------------------------------------------------------------------
-setup_cron_jobs() {
-    print_info "Setting up cron jobs for sync scripts..."
-
-    if ! ask_yn "Set up system cron jobs for sync scripts? (Skip if you plan to use the built-in Scheduler from the control panel)" "n"; then
-        print_info "Skipping cron job setup."
-        return 0
-    fi
-
-    local logs_dir="${BASE_DIR}/logs"
-
-    # Each entry: "schedule script logfile"
-    local -a cron_entries=(
-        "0 * * * * /usr/bin/python3 ${INSTALL_DIR}/scripts/plex-watchlist-sync.py >> ${logs_dir}/watchlist-sync.log 2>&1"
-        "0 3 * * * /usr/bin/python3 ${INSTALL_DIR}/scripts/gostorm-sync-complete.py >> ${logs_dir}/gostorm-debug.log 2>&1"
-        "0 4 * * 0 /usr/bin/python3 ${INSTALL_DIR}/scripts/gostorm-tv-sync.py >> ${logs_dir}/gostorm-tv-sync.log 2>&1"
-    )
-
-    # Script name substrings used for deduplication checks
-    local -a cron_markers=(
-        "plex-watchlist-sync.py"
-        "gostorm-sync-complete.py"
-        "gostorm-tv-sync.py"
-    )
-
-    # Decide whether to edit root's crontab (via sudo -u SYSTEM_USER) or current user
-    local crontab_cmd
-    if [ "$(id -u)" -eq 0 ]; then
-        crontab_cmd="crontab -u ${SYSTEM_USER}"
-    else
-        crontab_cmd="crontab"
-    fi
-
-    # Load existing crontab (gracefully handle empty/missing crontab)
-    local existing_crontab
-    existing_crontab=$(${crontab_cmd} -l 2>/dev/null || true)
-
-    local new_crontab="$existing_crontab"
-    local added=0
-
-    for i in "${!cron_entries[@]}"; do
-        local entry="${cron_entries[$i]}"
-        local marker="${cron_markers[$i]}"
-
-        if echo "$existing_crontab" | grep -qF "$marker"; then
-            print_warn "Cron entry for ${marker} already exists — skipping."
-        else
-            # Append a newline before the new entry if crontab is not empty
-            if [ -n "$new_crontab" ]; then
-                new_crontab="${new_crontab}"$'\n'"${entry}"
-            else
-                new_crontab="${entry}"
-            fi
-            print_ok "Cron added: ${entry}"
-            (( added++ )) || true
-        fi
-    done
-
-    if [ "$added" -gt 0 ]; then
-        echo "$new_crontab" | ${crontab_cmd} -
-        print_ok "${added} cron job(s) installed."
-    else
-        print_info "No new cron entries were needed."
-    fi
-}
-
 # ==============================================================================
-# Final summary
+# Final summary — clears screen, shows full logo + completion screen
 # ==============================================================================
 show_summary() {
+    local cols; cols=$(get_cols)
+    local msg; msg=$(pick_msg _MSGS_DONE)
+
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    draw_logo
+
     echo ""
-    echo "${BOLD}${GREEN}╔══════════════════════════════════════╗${NC}"
-    echo "${BOLD}${GREEN}║  Installation Complete!              ║${NC}"
-    echo "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
+    print_hr "$PGRN" "═"
+    printf "  %s%s  ✔  Installation Complete!%s\n" "$PGRN" "$BOLD" "$PRST$NC"
+    printf "  %s  %s%s\n" "$PSUB" "$msg" "$PRST"
+    print_hr "$PGRN" "═"
     echo ""
-    echo "  Configuration written to:"
-    echo "    ${BOLD}${INSTALL_DIR}/config.json${NC}"
+
+    printf "  %sFiles written:%s\n" "$PTEAL" "$PRST"
+    printf "    %s%s/config.json%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
+    printf "    %s/etc/systemd/system/gostream.service%s\n" "$BOLD" "$NC"
     echo ""
-    echo "  Service files installed:"
-    echo "    /etc/systemd/system/gostream.service"
-    echo "    /etc/systemd/system/health-monitor.service"
+
+    if [ "$INSTALL_SAMBA" = "true" ]; then
+        printf "  %s⚠  Samba — edit /etc/samba/smb.conf:%s\n" "$PYLW" "$PRST"
+        printf "  %s   oplocks = no  │  aio read size = 1  │  deadtime = 15  │  vfs objects = fileid%s\n" "$PDIM" "$PRST"
+        printf "  %s   Then: sudo systemctl restart smbd%s\n" "$PYLW" "$PRST"
+        echo ""
+    fi
+
+    print_hr "$PDIM"
+    printf "  %s%sNext steps%s\n" "$BOLD" "$PTEAL" "$PRST$NC"
+    print_hr "$PDIM"
     echo ""
-    echo "${BOLD}Next steps:${NC}"
+
+    printf "  %s 1 %s  sudo systemctl start gostream\n" "$PBOX$BOLD" "$PRST$NC"
+    printf "  %s 2 %s  sudo systemctl status gostream\n" "$PBOX$BOLD" "$PRST$NC"
+    printf "  %s 3 %s  tail -f %s/logs/gostream.log\n" "$PBOX$BOLD" "$PRST$NC" "$INSTALL_DIR"
     echo ""
-    echo "  1. Start services:"
-    echo "     ${YELLOW}sudo systemctl start gostream health-monitor${NC}"
+
+    # Card background — dark gray (256-color only, transparent on 8-color)
+    local BG=""
+    [ "${_ncolors:-8}" -ge 256 ] && BG=$'\e[48;5;235m'
+
+    local bi=$(( cols - 6 ))   # box inner width (chars between ║ and ║)
+    local _i
+
+    # Draw top border with title embedded: 1(═) + title_len + rest(═) = bi ✓
+    _btop() {
+        local t="$1" tl=${#1}
+        local rest=$(( bi - tl - 1 ))
+        [ $rest -lt 0 ] && rest=0
+        printf "  %s%s╔═%s%s" "$PBOX" "$BOLD" "$t" "$PBOX$BOLD"
+        for ((_i=0; _i<rest; _i++)); do printf "═"; done
+        printf "╗%s\n" "$PRST$NC"
+    }
+
+    # Draw a centered text line inside the box: lpad + text_len + rpad = bi ✓
+    _bline() {
+        local t="$1" fc="${2:-$PRST}"
+        local tl=${#t}
+        local lp=$(( (bi - tl) / 2 ))
+        local rp=$(( bi - lp - tl ))
+        [ $lp -lt 0 ] && lp=0
+        [ $rp -lt 0 ] && rp=0
+        printf "  %s║%s" "$PBOX$BOLD" "$BG"
+        printf "%${lp}s" ""
+        printf "%s%s%s" "$fc" "$t" "$PRST"
+        printf "%s%${rp}s" "$BG" ""
+        printf "%s║%s\n" "$PRST$PBOX$BOLD" "$PRST$NC"
+    }
+
+    # Draw a blank line inside the box
+    _bblank() {
+        printf "  %s║%s%${bi}s%s║%s\n" \
+            "$PBOX$BOLD" "$BG" "" "$PRST$PBOX$BOLD" "$PRST$NC"
+    }
+
+    # Draw bottom border
+    _bbot() {
+        printf "  %s%s╚" "$PBOX" "$BOLD"
+        for ((_i=0; _i<bi; _i++)); do printf "═"; done
+        printf "╝%s\n" "$PRST$NC"
+    }
+
+    printf "\n"
+
+    # ── Control Panel ────────────────────────────────────────────────────────
+    _btop "  Control Panel  "
+    _bline "Plex · TMDB · NAT-PMP · Ports · Scheduler · Webhooks" "$PSUB"
+    _bblank
+    _bline "http://<your-ip>:9080/control" "$BOLD$P4"
+    _bbot
+
     echo ""
-    echo "  2. Configure Plex Webhook:"
-    echo "     Open Plex → Settings → Webhooks → Add:"
-    echo "     ${BOLD}http://<your-pi-ip>:${METRICS_PORT}/plex-webhook${NC}"
-    echo ""
-    echo "  3. Configure Samba (critical for stability):"
-    echo "     Edit /etc/samba/smb.conf and ensure your share has:"
-    echo "       oplocks = no"
-    echo "       aio read size = 1"
-    echo "       deadtime = 15"
-    echo "       vfs objects = fileid"
-    echo "     Then: ${YELLOW}sudo systemctl restart smbd${NC}"
-    echo ""
-    echo "  4. Check status:"
-    echo "     ${YELLOW}sudo systemctl status gostream${NC}"
-    echo "     ${YELLOW}curl http://127.0.0.1:${METRICS_PORT}/metrics${NC}"
-    echo ""
-    echo "  5. Dashboards:"
-    echo "     ${BOLD}http://<your-ip>:${DASHBOARD_PORT}${NC}  (Health Monitor)"
-    echo "     ${BOLD}http://<your-ip>:${METRICS_PORT}/control${NC}  (GoStream Control Panel)"
-    echo ""
-    echo "  6. Sync scripts (run manually or via cron):"
-    echo "     ${YELLOW}python3 ${INSTALL_DIR}/scripts/gostorm-sync-complete.py${NC}  # Movies"
-    echo "     ${YELLOW}python3 ${INSTALL_DIR}/scripts/gostorm-tv-sync.py${NC}         # TV"
-    echo "     ${YELLOW}python3 ${INSTALL_DIR}/scripts/plex-watchlist-sync.py${NC}     # Watchlist"
-    echo ""
-    echo "  7. Logs:"
-    echo "     ${YELLOW}tail -f ${BASE_DIR}/logs/gostream.log${NC}"
+
+    # ── Dashboard ────────────────────────────────────────────────────────────
+    _btop "  Dashboard  "
+    _bblank
+    _bline "http://<your-ip>:9080/dashboard" "$BOLD$P4"
+    _bbot
+
     echo ""
 }
 
@@ -1068,21 +1056,22 @@ main() {
     # Note: FUSERMOUNT_CMD is set inside check_prerequisites
     FUSERMOUNT_CMD="fusermount3"
 
+    # Default: Samba enabled (can be overridden by collect_options)
+    INSTALL_SAMBA=true
+
+    collect_paths
+    collect_options
+
     install_system_deps
     check_prerequisites
 
-    collect_paths
-    collect_plex
-    collect_apis
-    collect_hardware
+    wizard_header "[3/3] Installing" 3 3
 
-    print_header "[5/5] Installing"
-
+    clone_repo
+    echo ""
     deploy_files
     echo ""
     generate_config_json
-    echo ""
-    install_python_deps
     echo ""
     create_directories
     echo ""
@@ -1091,8 +1080,6 @@ main() {
     enable_services
     echo ""
     setup_sudoers
-    echo ""
-    setup_cron_jobs
     echo ""
     compile_binary
     echo ""

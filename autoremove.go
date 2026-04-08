@@ -75,18 +75,30 @@ func (tr *TorrentRemover) RemoveTorrentByHash(hash string) error {
 	return tr.removeTorrent(hash)
 }
 
-// extractHashFromFile reads the first line of the virtual mkv to get the hash
+// extractHashFromFile reads the virtual mkv to get the hash.
+// Supports both JSON (new) and line-based (legacy) formats.
 func (tr *TorrentRemover) extractHashFromFile(path string) string {
-	file, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
+	content := string(data)
+	trimmed := strings.TrimSpace(content)
 
-	scanner := bufio.NewScanner(file)
+	// Detect JSON format
+	if strings.HasPrefix(trimmed, "{") {
+		var j mkvJSON
+		if err := json.Unmarshal([]byte(content), &j); err != nil {
+			return ""
+		}
+		match := tr.hashPattern.FindString(j.URL)
+		return strings.ToLower(match)
+	}
+
+	// Legacy line-based: read first line and extract hash
+	scanner := bufio.NewScanner(strings.NewReader(content))
 	if scanner.Scan() {
 		line := scanner.Text()
-		// Search for 40-char hex string (link=HASH...)
 		match := tr.hashPattern.FindString(line)
 		return strings.ToLower(match)
 	}

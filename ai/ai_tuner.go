@@ -26,7 +26,13 @@ var consecutiveTimeouts int32
 var cooldownUntil time.Time
 
 const maxConsecutiveTimeouts = 3
-const cooldownDuration = 5 * time.Minute
+const cooldownDuration = 2 * time.Minute
+
+// Reset lock: prevents concurrent reset + completion requests to llama-server
+var resetInProgress atomic.Bool
+
+// skipAICycles: after a context reset, skip N AI cycles before calling llama-server
+var skipAICycles int
 
 var lastConns = 0
 var lastTimeout = 0
@@ -45,9 +51,28 @@ var peakCPUCycle float64
 const normalCycle = 36 // 180s
 const crisisCycle = 12 // 60s
 
+// AIProvider holds configuration for LLM backends
+type AIProvider struct {
+	URL          string     // Base URL (local: http://127.0.0.1:8085, openrouter: https://openrouter.ai/api/v1)
+	APIKey       string     // API key for cloud providers (empty for local)
+	Model        string     // Model ID for cloud providers (empty for local)
+	IsLocal      bool       // true = llama.cpp, false = cloud API
+	GetBufferPct func() int // Returns FUSE buffer fill percentage (0-100)
+}
+
 // Keep-Alive client for llama.cpp local
 var aiClient = &http.Client{
-	Timeout: 45 * time.Second,
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:      10,
+		IdleConnTimeout:   90 * time.Second,
+		DisableKeepAlives: false,
+	},
+}
+
+// HTTP client for cloud providers (longer timeout for API latency)
+var cloudAIClient = &http.Client{
+	Timeout: 120 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:      10,
 		IdleConnTimeout:   90 * time.Second,
@@ -63,8 +88,18 @@ type AITweak struct {
 	PeerTimeout      float64 `json:"peer_timeout_seconds"`
 }
 
-func resetLlamaCache(aiURL string) {
-	base := strings.TrimSuffix(aiURL, "/completion")
+func resetLlamaCache(provider AIProvider) {
+	if !provider.IsLocal {
+		return
+	}
+	// Deduplicate: if a reset (or completion) is already in flight, skip.
+	if !resetInProgress.CompareAndSwap(false, true) {
+		log.Printf("[AI-Pilot] KV cache reset skipped: server busy")
+		return
+	}
+	defer resetInProgress.Store(false)
+
+	base := strings.TrimSuffix(provider.URL, "/completion")
 	url := base + "/slots/0?action=erase"
 	resp, err := cacheResetClient.Post(url, "application/json", nil)
 	if err != nil {
@@ -94,7 +129,11 @@ func (t *AITweak) Sanitize() {
 	}
 }
 
-func crisisActive() bool {
+func crisisActive(buffer int) bool {
+	// Se il buffer è quasi pieno (>95%), non siamo in crisi anche se la velocità è 0
+	if buffer > 95 {
+		return false
+	}
 	return getAverage(torrentSpeedAvg) < 2.0 && len(torrentSpeedAvg) > 8
 }
 
@@ -109,16 +148,25 @@ func getAverage(samples []float64) float64 {
 	return sum / float64(len(samples))
 }
 
-func StartAITuner(ctx context.Context, aiURL string) {
-	if aiURL == "" {
-		aiURL = "http://127.0.0.1:8085"
+func StartAITuner(ctx context.Context, provider AIProvider) {
+	if provider.URL == "" {
+		provider.URL = "http://127.0.0.1:8085"
 	}
 	// Pulizia URL
-	aiURL = strings.ReplaceAll(aiURL, " -d", "")
-	aiURL = strings.TrimSuffix(aiURL, "/completion")
-	aiURL = strings.TrimSuffix(aiURL, "/")
+	provider.URL = strings.ReplaceAll(provider.URL, " -d", "")
+	provider.URL = strings.TrimSuffix(provider.URL, "/completion")
+	provider.URL = strings.TrimSuffix(provider.URL, "/")
 
-	log.Printf("[AI-Pilot] Initializing llama.cpp Bridge (%s)... waiting for system settings.", aiURL)
+	// Auto-detect provider type if not explicitly set
+	if provider.URL == "http://127.0.0.1:8085" || strings.Contains(provider.URL, "127.0.0.1") || strings.Contains(provider.URL, "localhost") {
+		provider.IsLocal = true
+	}
+
+	if provider.IsLocal {
+		log.Printf("[AI-Pilot] Initializing llama.cpp Bridge (%s)... waiting for system settings.", provider.URL)
+	} else {
+		log.Printf("[AI-Pilot] Initializing Cloud LLM Provider (%s, model: %s)... waiting for system settings.", provider.URL, provider.Model)
+	}
 	for i := 0; i < 30; i++ {
 		if settings.BTsets != nil && settings.BTsets.TorrentDisconnectTimeout > 0 {
 			break
@@ -139,7 +187,7 @@ func StartAITuner(ctx context.Context, aiURL string) {
 	for {
 		select {
 		case <-ticker.C:
-			runTuningCycle(aiURL)
+			runTuningCycle(provider)
 		case <-ctx.Done():
 			return
 		}
@@ -148,8 +196,9 @@ func StartAITuner(ctx context.Context, aiURL string) {
 
 var lastActiveHash string
 var lastAnnounceAt time.Time
+var wasIdle bool // true when count==0 in last cycle — triggers skipAICycles on next torrent
 
-func runTuningCycle(aiURL string) {
+func runTuningCycle(provider AIProvider) {
 	if aiDisabled.Load() {
 		return
 	}
@@ -166,13 +215,14 @@ func runTuningCycle(aiURL string) {
 		cycleCounter = 0
 		peakCPUCycle = 0
 		if lastActiveHash != "" {
-			go resetLlamaCache(aiURL)
+			go resetLlamaCache(provider)
 			if lastConns != defaultConns || lastTimeout != defaultTimeout {
 				log.Printf("[AI-Pilot] Playback ended — restoring defaults (Conns:%d Timeout:%ds)", defaultConns, defaultTimeout)
 				lastConns = defaultConns
 				lastTimeout = defaultTimeout
 			}
 		}
+		wasIdle = true
 		atomic.StoreInt32(&CurrentLimit, 0) // fall back to globalConfig.MasterConcurrencyLimit
 		lastActiveHash = ""
 		return
@@ -207,7 +257,7 @@ func runTuningCycle(aiURL string) {
 				cpuUsageAvg = nil
 				cycleCounter = 0
 				peakCPUCycle = 0
-				go resetLlamaCache(aiURL)
+				go resetLlamaCache(provider)
 			}
 			return
 		}
@@ -229,8 +279,16 @@ func runTuningCycle(aiURL string) {
 	}
 
 	currentHash := activeT.Hash().String()
-	if lastActiveHash != "" && currentHash != lastActiveHash {
-		log.Printf("[AI-Pilot] Context Change Detected: Resetting history for new torrent.")
+	contextChanged := lastActiveHash != "" && currentHash != lastActiveHash
+	freshStart := wasIdle && lastActiveHash == ""
+	wasIdle = false
+
+	if contextChanged || freshStart {
+		reason := "Context Change"
+		if freshStart {
+			reason = "Fresh Start"
+		}
+		log.Printf("[AI-Pilot] %s Detected: Applying defaults (Conns:%d Timeout:%ds) for new torrent.", reason, defaultConns, defaultTimeout)
 		metricsHistory = nil
 		torrentSpeedAvg = nil
 		cpuUsageAvg = nil
@@ -240,7 +298,13 @@ func runTuningCycle(aiURL string) {
 		pulseCounter = 0
 		peakCPUCycle = 0
 		lastAnnounceAt = time.Time{}
-		go resetLlamaCache(aiURL)
+		skipAICycles = 1 // skip 1 AI cycle to allow peer discovery at full connections
+		if activeT.Torrent != nil {
+			activeT.Torrent.SetMaxEstablishedConns(defaultConns)
+			activeT.AddExpiredTime(time.Duration(defaultTimeout) * time.Second)
+		}
+		atomic.StoreInt32(&CurrentLimit, int32(defaultConns))
+		go resetLlamaCache(provider)
 	}
 	lastActiveHash = currentHash
 
@@ -265,13 +329,32 @@ func runTuningCycle(aiURL string) {
 	// AI CYCLE: adaptive — 180s normal, 60s in crisis (avg speed < 1MB/s)
 	cycleCounter++
 	threshold := normalCycle
-	if crisisActive() {
+
+	buffer := 100
+	if provider.GetBufferPct != nil {
+		buffer = provider.GetBufferPct()
+	}
+
+	if crisisActive(buffer) {
 		threshold = crisisCycle
 	}
 	if cycleCounter < threshold {
 		return
 	}
 	cycleCounter = 0
+
+	// Post-reset guard: skip AI call if we're still in the cooldown after context change
+	if skipAICycles > 0 {
+		skipAICycles--
+		log.Printf("[AI-Pilot] Post-reset guard: skipping AI call (%d cycles remaining)", skipAICycles)
+		return
+	}
+
+	// Server busy guard: skip if a reset is in flight
+	if resetInProgress.Load() {
+		log.Printf("[AI-Pilot] Server busy (reset in progress): skipping AI call.")
+		return
+	}
 
 	// --- SMART CONTEXT GENERATION (Every 3m) ---
 	avgTorrentSpeed := getAverage(torrentSpeedAvg)
@@ -287,17 +370,20 @@ func runTuningCycle(aiURL string) {
 		}
 	}
 
-	buffer := 100
-	if activeT.GetCache() != nil {
-		cs := activeT.GetCache().GetState()
-		if cs.Capacity > 0 {
-			buffer = int(cs.Filled * 100 / cs.Capacity)
-		}
-	}
-
-	// IDLE GUARD: buffer full + no download → nothing to optimize
+	// IDLE GUARD: buffer full + no download → restore defaults for next episode
 	if buffer > 95 && currSpeedMBs == 0 {
-		log.Printf("[AI-Pilot] Idle guard: buffer=%d%% speed=0 — skipping AI call.", buffer)
+		if lastConns != defaultConns || lastTimeout != defaultTimeout {
+			log.Printf("[AI-Pilot] Idle guard: buffer=%d%% speed=0 — restoring defaults (Conns:%d Timeout:%ds).", buffer, defaultConns, defaultTimeout)
+			if activeT.Torrent != nil {
+				activeT.Torrent.SetMaxEstablishedConns(defaultConns)
+				activeT.AddExpiredTime(time.Duration(defaultTimeout) * time.Second)
+			}
+			atomic.StoreInt32(&CurrentLimit, int32(defaultConns))
+			lastConns = defaultConns
+			lastTimeout = defaultTimeout
+		} else {
+			log.Printf("[AI-Pilot] Idle guard: buffer=%d%% speed=0 — skipping AI call.", buffer)
+		}
 		return
 	}
 
@@ -323,29 +409,27 @@ func runTuningCycle(aiURL string) {
 	// Re-zero peak for next 3m cycle
 	peakCPUCycle = 0
 
-	// Qwen3 ChatML template con Few-Shot Examples (Full Data)
+	// Dynamic Optimizer Prompt for Minimax/Cloud Providers (Fine-tuned for RP4)
 	prompt := fmt.Sprintf(
-		"<|im_start|>system\nBitTorrent Optimizer. Examples:\n"+
-			"- Peers:2, Total:10, Size:2GB, Speed:0, CPU:25 -> {\"connections_limit\":5,\"peer_timeout_seconds\":60}\n"+
-			"- Peers:50, Total:150, Size:40GB, Speed:15, CPU:30 -> {\"connections_limit\":50,\"peer_timeout_seconds\":15}\n"+
-			"- Peers:40, Total:80, Size:15GB, Speed:10, CPU:90 -> {\"connections_limit\":12,\"peer_timeout_seconds\":20}\n"+
-			"Output ONLY JSON. Use 2-digit seconds for timeout.<|im_end|>\n"+
-			"<|im_start|>user\nPeers:%d, Total:%d, Size:%.1fGB, Speed:%.1fMB/s, CPU:%d%%, Buf:%d%%, History:%s, Trend:%s<|im_end|>\n"+
-			"<|im_start|>assistant\n",
+		"BitTorrent Optimizer for Raspberry Pi 4. Default settings: 25 connections, 30s peer timeout. "+
+			"Output ONLY JSON: {\"connections_limit\": int, \"peer_timeout_seconds\": int}. "+
+			"Perform dynamic fine-tuning for BOTH values independently: lower timeout (<30s) to prune dead peers during stalls, higher timeout (>30s) to stabilize slow but steady peers. Adjust connections to balance CPU load (target <60%). If speed is below 3MB/s increase connections. If file size is circa 20GB tune to get 5MB/s or more\n"+
+			"User context:\n"+
+			"Peers:%d, Total:%d, Size:%.1fGB, Speed:%.1fMB/s, CPU:%d%%, Buf:%d%%, History:%s, Trend:%s",
 		activeStats.ActivePeers, activeStats.TotalPeers, fileSizeGB, currSpeedMBs, int(currentCPU), buffer, historyStr, speedTrendStr,
 	)
 
-	tweak, err := fetchAIJSON[AITweak](aiURL, prompt)
+	tweak, err := fetchAIJSON[AITweak](provider, prompt)
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
 			if !aiDisabled.Swap(true) {
-				log.Printf("[AI-Pilot] LLM not reachable (%s) — auto-disabled. Restart gostream to re-enable.", aiURL)
+				log.Printf("[AI-Pilot] LLM not reachable (%s) — auto-disabled. Restart gostream to re-enable.", provider.URL)
 			}
 			return
 		}
 		failures := atomic.AddInt32(&consecutiveTimeouts, 1)
 		log.Printf("[AI-Pilot] Communication Delay (%d/%d): %v", failures, maxConsecutiveTimeouts, err)
-		go resetLlamaCache(aiURL)
+		go resetLlamaCache(provider)
 		if failures >= maxConsecutiveTimeouts {
 			cooldownUntil = time.Now().Add(cooldownDuration)
 			atomic.StoreInt32(&consecutiveTimeouts, 0)
@@ -403,11 +487,22 @@ func runTuningCycle(aiURL string) {
 
 }
 
-func fetchAIJSON[T any](url string, prompt string) (*T, error) {
+func fetchAIJSON[T any](provider AIProvider, prompt string) (*T, error) {
+	if provider.IsLocal {
+		return fetchLocalJSON[T](provider, prompt)
+	}
+	return fetchCloudJSON[T](provider, prompt)
+}
+
+func fetchLocalJSON[T any](provider AIProvider, prompt string) (*T, error) {
+	if !resetInProgress.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("server busy (reset in progress)")
+	}
+	defer resetInProgress.Store(false)
+
 	start := time.Now()
 
-	grammar := `root ::= "{\"connections_limit\":" number ",\"peer_timeout_seconds\":" number "}"
-number ::= [0-9]+`
+	grammar := "root ::= \"{\\\"connections_limit\\\":\" number \",\\\"peer_timeout_seconds\\\":\" number \"}\"\nnumber ::= [0-9]+"
 
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"prompt":       prompt,
@@ -419,7 +514,7 @@ number ::= [0-9]+`
 		"keep_alive":   -1,
 	})
 
-	endpoint := url + "/completion"
+	endpoint := provider.URL + "/completion"
 	resp, err := aiClient.Post(endpoint, "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, err
@@ -464,6 +559,81 @@ number ::= [0-9]+`
 
 	var result T
 	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		return nil, fmt.Errorf("AI decode error: %v (Original: %q)", err, trimmed)
+	}
+
+	return &result, nil
+}
+
+func fetchCloudJSON[T any](provider AIProvider, prompt string) (*T, error) {
+	start := time.Now()
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model": provider.Model,
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
+		},
+		"temperature": 0.1,
+		"max_tokens":  64,
+	})
+
+	req, err := http.NewRequest("POST", provider.URL+"/chat/completions", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	// OpenRouter headers
+	req.Header.Set("HTTP-Referer", "https://gostream.workers.dev")
+	req.Header.Set("X-Title", "GoStream AI Tuner")
+
+	resp, err := cloudAIClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Status %d | Body: %s", resp.StatusCode, string(body))
+	}
+
+	var cloudResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cloudResp); err != nil {
+		return nil, fmt.Errorf("AI decode error: %v", err)
+	}
+
+	if len(cloudResp.Choices) == 0 {
+		return nil, fmt.Errorf("empty AI response (no choices)")
+	}
+
+	trimmed := strings.TrimSpace(cloudResp.Choices[0].Message.Content)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty AI response")
+	}
+	log.Printf("[AI-Pilot] RAW: %q | Latency: %v", trimmed, time.Since(start))
+
+	// Extract JSON from markdown if wrapped
+	if idx := strings.Index(trimmed, "```"); idx != -1 {
+		// Find the JSON between ```json and ``` or just between ``` and ```
+		startIdx := idx + 3
+		if startIdx < len(trimmed) && trimmed[startIdx:startIdx+4] == "json" {
+			startIdx += 4
+		}
+		endIdx := strings.Index(trimmed[startIdx:], "```")
+		if endIdx != -1 {
+			trimmed = strings.TrimSpace(trimmed[startIdx : startIdx+endIdx])
+		}
+	}
+
+	var result T
+	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
 		return nil, fmt.Errorf("AI decode error: %v (Original: %q)", err, trimmed)
 	}
 

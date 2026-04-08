@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -34,7 +35,16 @@ var (
 	ErrInvalidURL    = errors.New("stream URL must start with http:// or https://")
 )
 
-// ReadMetadataFromFile reads metadata from a virtual .mkv file
+// mkvJSON is the internal JSON representation of a .mkv file.
+type mkvJSON struct {
+	URL    string `json:"url"`
+	Size   int64  `json:"size"`
+	Magnet string `json:"magnet"`
+	Imdb   string `json:"imdb"`
+}
+
+// ReadMetadataFromFile reads metadata from a virtual .mkv file.
+// Supports both JSON (new) and line-based (legacy) formats.
 func ReadMetadataFromFile(path string) (*FileMetadata, error) {
 	// Get file info for mtime
 	info, err := os.Stat(path)
@@ -49,6 +59,48 @@ func ReadMetadataFromFile(path string) (*FileMetadata, error) {
 	}
 
 	content := string(data)
+	trimmed := strings.TrimSpace(content)
+
+	// Detect JSON format
+	if strings.HasPrefix(trimmed, "{") {
+		return parseJSONFormat(trimmed, info, path)
+	}
+
+	// Legacy line-based format
+	return parseLineFormat(content, info, path)
+}
+
+func parseJSONFormat(content string, info os.FileInfo, path string) (*FileMetadata, error) {
+	var j mkvJSON
+	if err := json.Unmarshal([]byte(content), &j); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	url := strings.TrimSpace(j.URL)
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return nil, ErrInvalidURL
+	}
+
+	if j.Size < MinFileSize || j.Size > MaxFileSize {
+		return nil, fmt.Errorf("%w: got %d bytes", ErrInvalidSize, j.Size)
+	}
+
+	imdbID := j.Imdb
+	if imdbID == "" {
+		reID := regexp.MustCompile(`tt\d{7,10}`)
+		imdbID = reID.FindString(content)
+	}
+
+	return &FileMetadata{
+		URL:    url,
+		Size:   j.Size,
+		Mtime:  info.ModTime(),
+		Path:   path,
+		ImdbID: imdbID,
+	}, nil
+}
+
+func parseLineFormat(content string, info os.FileInfo, path string) (*FileMetadata, error) {
 	lines := strings.Split(content, "\n")
 	if len(lines) < 2 {
 		return nil, ErrInvalidFormat
@@ -96,8 +148,17 @@ func ReadMetadataFromFile(path string) (*FileMetadata, error) {
 	}, nil
 }
 
-// WriteMetadataToFile writes metadata to a virtual .mkv file
+// WriteMetadataToFile writes metadata to a virtual .mkv file in JSON format.
 func WriteMetadataToFile(path, url string, size int64, imdbID string) error {
-	content := fmt.Sprintf("%s\n%d\nmagnet:?xt=urn:btih:legacy\n%s\n", url, size, imdbID)
-	return os.WriteFile(path, []byte(content), 0644)
+	j := mkvJSON{
+		URL:    url,
+		Size:   size,
+		Magnet: "",
+		Imdb:   imdbID,
+	}
+	data, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
 }

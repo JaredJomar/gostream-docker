@@ -2,12 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"gostream/internal/prowlarr"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // DailyJobConfig: task that can run on specific days of the week.
@@ -29,6 +32,39 @@ type SchedulerConfig struct {
 	MoviesSync    DailyJobConfig      `json:"movies_sync"`
 	TVSync        DailyJobConfig      `json:"tv_sync"`
 	WatchlistSync WatchlistSyncConfig `json:"watchlist_sync"`
+}
+
+// EngineConfig holds per-engine paths for subprocess sync.
+type EngineConfig struct {
+	ScriptPath string
+	LogsDir    string
+}
+
+// QualityWeights defines scoring weights for movie selection.
+type QualityWeights struct {
+	Res4K           int `json:"res_4k"`
+	Res1080p        int `json:"res_1080p"`
+	HDR             int `json:"hdr"`
+	DolbyVision     int `json:"dolby_vision"`
+	HDR10Plus       int `json:"hdr10_plus"`
+	Atmos           int `json:"atmos"`
+	Audio51         int `json:"audio_5_1"`
+	Stereo          int `json:"stereo"`
+	BluRay          int `json:"bluray"`
+	SeederBonus     int `json:"seeder_bonus"`
+	SeederThreshold int `json:"seeder_threshold"`
+}
+
+// TVQualityWeights extends QualityWeights with TV-specific bonuses.
+type TVQualityWeights struct {
+	QualityWeights
+	FullpackBonus int `json:"fullpack_bonus"`
+}
+
+// QualityScoringConfig holds optional quality scoring profiles.
+type QualityScoringConfig struct {
+	Movies *QualityWeights   `json:"movies,omitempty"`
+	TV     *TVQualityWeights `json:"tv,omitempty"`
 }
 
 // Config holds all configurable parameters for the FUSE proxy
@@ -74,7 +110,10 @@ type Config struct {
 	ProxyListenPort int    `json:"proxy_listen_port"`
 	MetricsPort     int    `json:"metrics_port"`
 	BlockListURL    string `json:"blocklist_url"`
-	AIURL           string `json:"ai_url"` // V1.4.5: AI Optimizer sidecar URL
+	AIURL           string `json:"ai_url"`      // V1.4.5: AI Optimizer sidecar URL
+	AIProvider      string `json:"ai_provider"` // V1.7.1: Provider type (local, openrouter, openai)
+	AIModel         string `json:"ai_model"`    // V1.7.1: Model ID for cloud providers
+	AI_API_KEY      string `json:"ai_api_key"`  // V1.7.1: API key for cloud providers
 
 	// --- FUSE Paths ---
 	// Fallback when CLI args are omitted. CLI args always take precedence.
@@ -127,14 +166,40 @@ type Config struct {
 	TorrentioURL string `json:"torrentio_url"` // Torrentio base URL (used when Prowlarr is disabled)
 
 	// --- Prowlarr Indexer ---
-	Prowlarr struct {
-		Enabled bool   `json:"enabled"`
-		APIKey  string `json:"api_key"`
-		URL     string `json:"url"`
-	} `json:"prowlarr"`
+	Prowlarr prowlarr.ConfigProwlarr `json:"prowlarr"`
 
 	// --- Built-in Sync Scheduler ---
 	Scheduler SchedulerConfig `json:"scheduler"`
+
+	// --- Media Server ---
+	MediaServerType string `json:"media_server_type"` // "plex" | "jellyfin"
+
+	// --- Quality Scoring ---
+	QualityScoringConfig QualityScoringConfig `json:"quality_scoring"`
+
+	// --- Engine Scripts (populated in LoadConfig, not from JSON) ---
+	EngineScripts map[string]EngineConfig `json:"-"`
+
+	// --- Telemetry (V1.4.7) ---
+	TelemetryID     string `json:"telemetry_id"`
+	EnableTelemetry bool   `json:"telemetry"`
+	TelemetryURL    string `json:"telemetry_url"`
+
+	// --- State DB (V1.7.1) ---
+	EnableStateDB bool   `json:"enable_state_db"` // default: true
+	StateDBPath   string `json:"state_db_path"`   // default: <STATE>/gostream.db
+}
+
+// Save persists the current configuration to config.json
+func (c *Config) Save() error {
+	// 1. Marshal config to JSON
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// 2. Write to file
+	return os.WriteFile(c.ConfigPath, data, 0644)
 }
 
 // LoadConfig loads configuration from environment variables with defaults
@@ -177,9 +242,13 @@ func LoadConfig() Config {
 
 		TorrentioURL:    "https://torrentio.strem.fun",
 		GoStormBaseURL:  "http://127.0.0.1:8090",
-		AIURL:           "http://127.0.0.1:8085", // Default Pi internal AI port (V1.4.5)
 		ProxyListenPort: 8080,
-		MetricsPort:     8096,
+		MetricsPort:     9080,
+
+		EnableTelemetry: true,
+		TelemetryURL:    "https://telemetry.gostream.workers.dev",
+
+		EnableStateDB: true,
 
 		// Legacy Fixed Defaults
 		DefaultFileSize:         30 * 1024 * 1024 * 1024,
@@ -237,6 +306,26 @@ func LoadConfig() Config {
 	// 5. Finalize and map derived fields
 	cfg.finalize()
 
+	// 5b. Populate engine script paths
+	exe, _ := os.Executable()
+	binDir := filepath.Dir(exe)
+	scriptsDir := filepath.Join(binDir, "scripts")
+	logsDir := filepath.Join(binDir, "logs")
+	cfg.EngineScripts = map[string]EngineConfig{
+		"movies":    {ScriptPath: filepath.Join(scriptsDir, "gostorm-sync-complete.py"), LogsDir: logsDir},
+		"tv":        {ScriptPath: filepath.Join(scriptsDir, "gostorm-tv-sync.py"), LogsDir: logsDir},
+		"watchlist": {ScriptPath: filepath.Join(scriptsDir, "plex-watchlist-sync.py"), LogsDir: logsDir},
+	}
+
+	// 6. Generate Telemetry ID if missing
+	if cfg.TelemetryID == "" {
+		cfg.TelemetryID = uuid.New().String()
+		log.Printf("[Telemetry] Generated new ID: %s", cfg.TelemetryID)
+		if err := cfg.Save(); err != nil {
+			log.Printf("[Telemetry] ERROR: Failed to persist generated ID: %v", err)
+		}
+	}
+
 	return cfg
 }
 
@@ -283,6 +372,15 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("MKV_PROXY_AI_URL"); v != "" {
 		c.AIURL = v
+	}
+	if v := os.Getenv("AI_PROVIDER"); v != "" {
+		c.AIProvider = v
+	}
+	if v := os.Getenv("AI_MODEL"); v != "" {
+		c.AIModel = v
+	}
+	if v := os.Getenv("AI_API_KEY"); v != "" {
+		c.AI_API_KEY = v
 	}
 	if v := firstEnv("GOSTREAM_PLEX_URL", "PLEX_URL"); v != "" {
 		c.Plex.URL = v
