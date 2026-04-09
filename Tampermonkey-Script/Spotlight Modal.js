@@ -458,6 +458,17 @@
         return uniqStrings(String(raw).split(',').map(x => x.trim()).filter(Boolean));
     }
 
+    function isLowQualityText(value) {
+        const text = String(value || '').toLowerCase();
+        return /(?:^|[\s._\-()[\]])(?:cam|camrip|hdcam|telesync|telecine|screener|dvdscr|predvd|vhsrip|workprint|r5|r6|ts|tc|sdtv|hdtv|hdrip|brrip|dvdrip|bdrip|480p|576p|720p|1080i|240p|360p)(?:$|[\s._\-()[\]])/i.test(text);
+    }
+
+    function isBlockedQualityItem(item) {
+        if (!item || typeof item !== 'object') return false;
+        const text = [item.title, item.reason].filter(Boolean).join(' ');
+        return isLowQualityText(text);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // API HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
@@ -749,24 +760,25 @@
     // SEARCH & RESULTS
     // ═══════════════════════════════════════════════════════════════════════════
     function renderResults(items) {
-        state.searchResults = items || [];
+        const safeItems = (items || []).filter(item => !isBlockedQualityItem(item));
+        state.searchResults = safeItems;
         state.highlightedIndex = -1;
         const resultsBox = document.getElementById('gs-results');
         if (!resultsBox) return;
 
-        if (!items || items.length === 0) {
+        if (!safeItems || safeItems.length === 0) {
             resultsBox.innerHTML = `
                 <div style="padding: 24px; text-align: center;">
                     <div style="font-size: 32px; margin-bottom: 8px; opacity: 0.5;">🎬</div>
-                    <div style="color: ${THEME.colors.text.secondary}; font-size: 13px;">No results found</div>
-                    <div style="color: ${THEME.colors.text.muted}; font-size: 12px; margin-top: 4px;">Try a different search term</div>
+                    <div style="color: ${THEME.colors.text.secondary}; font-size: 13px;">No suitable results found</div>
+                    <div style="color: ${THEME.colors.text.muted}; font-size: 12px; margin-top: 4px;">CAM, TS, TC, and sub-1080p candidates are blocked automatically</div>
                 </div>
             `;
             resultsBox.style.display = 'block';
             return;
         }
 
-        resultsBox.innerHTML = items.map((item, idx) => {
+        resultsBox.innerHTML = safeItems.map((item, idx) => {
             const safeTitle = escapeHtml(item.title);
             const badgeClass = item.type === 'movie' ? 'gs-badge-movie' : 'gs-badge-tv';
             const badgeText = item.type === 'movie' ? 'Movie' : 'Series';
@@ -951,7 +963,7 @@
         const box = document.getElementById('gs-confirm-list');
         if (!box) return;
 
-        const list = items || [];
+        const list = (items || []).filter(item => !isBlockedQualityItem(item));
         box.innerHTML = list.map((it, idx) => {
             const safeTitle = escapeHtml(it.title);
             const badgeClass = it.type === 'movie' ? 'gs-badge-movie' : 'gs-badge-tv';
@@ -1099,6 +1111,13 @@
     async function goToConfirmStep() {
         if (!state.selected) return;
 
+        if (isBlockedQualityItem(state.selected)) {
+            const status = document.getElementById('gs-request-status');
+            setRequestProcess('error', 'Blocked quality');
+            if (status) status.textContent = 'Blocked CAM/TS/TC or sub-1080p request candidate.';
+            return;
+        }
+
         const status = document.getElementById('gs-request-status');
         if (status) status.textContent = '';
 
@@ -1158,7 +1177,8 @@
             .filter(cb => cb.checked && !cb.disabled)
             .map(cb => state.confirmCandidates[Number(cb.getAttribute('data-idx'))])
             .filter(Boolean)
-            .filter(it => allowedByMode(it.type));
+            .filter(it => allowedByMode(it.type))
+            .filter(it => !isBlockedQualityItem(it));
 
         const movieIds = [...new Set(picked.filter(x => x.type === 'movie').map(x => Number(x.tmdb_id)).filter(n => Number.isFinite(n)))];
         const tvIds = [...new Set(picked.filter(x => x.type === 'tv').map(x => Number(x.tmdb_id)).filter(n => Number.isFinite(n)))];

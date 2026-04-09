@@ -14,10 +14,20 @@ import sys
 import time
 import requests
 import urllib3
-from prowlarr_client import ProwlarrClient
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import subprocess
+
+_ProwlarrClient: Any
+try:
+    from prowlarr_client import ProwlarrClient as _ProwlarrClient
+except ImportError:
+    _ProwlarrClient = None
+
+
+class _NullProwlarrClient:
+    def fetch_torrents(self, *args, **kwargs):
+        return []
 
 
 def _load_gostream_config() -> dict:
@@ -126,7 +136,7 @@ class GoStormSync:
         self._prune_movie_add_fail_cache()
         self.LOG_FILE = os.path.join(_cfg.get('_log_dir', '/home/pi/logs'), 'gostorm-debug.log')
         # TMDB / Torrentio
-        self.TMDB_API_KEY = _cfg.get('tmdb_api_key', '')
+        self.TMDB_API_KEY = os.getenv('TMDB_API_KEY') or os.getenv('GOSTREAM_TMDB_API_KEY') or _cfg.get('tmdb_api_key', '')
         self.TMDB_BASE_URL = "https://api.themoviedb.org/3"
         self.TORRENTIO_BASE_URL = _cfg.get('torrentio_url', 'https://torrentio.strem.fun')
         
@@ -137,7 +147,10 @@ class GoStormSync:
         self.TORRENTIO_PROVIDERS = os.getenv("TORRENTIO_PROVIDERS", "")  # empty = all providers
 
         # Prowlarr Adapter
-        self.prowlarr = ProwlarrClient()
+        if _ProwlarrClient is not None:
+            self.prowlarr = _ProwlarrClient()
+        else:
+            self.prowlarr = _NullProwlarrClient()
         # Sizes
         self.BYTES_PER_GB = 1024 * 1024 * 1024
         self.MOVIE_4K_MIN_GB = int(os.getenv("MOVIE_4K_MIN_GB", "10"))  # ora configurabile via ENV
@@ -329,7 +342,15 @@ class GoStormSync:
             magnet += f"&tr={quote(tr)}"
         return magnet
 
-    def safe_curl(self, url: str, method: str = "GET", data: Dict = None, params: Dict = None, headers: Dict = None, timeout: int = 30) -> Optional[requests.Response]:
+    def safe_curl(
+        self,
+        url: str,
+        method: str = "GET",
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        timeout: int = 30,
+    ) -> Optional[requests.Response]:
         """
         Enhanced safe_curl with rate limiting, exponential backoff + jitter, and improved error handling
         """
@@ -829,7 +850,7 @@ class GoStormSync:
             return hash_value
         return ""
 
-    def calculate_quality_score(self, title: str, filename: str = "", seeders: int = 0, debug: bool = False) -> int:
+    def calculate_quality_score(self, title: str, filename: str = "", seeders: int = 0, debug: bool = False) -> Any:
         """
         UNIFIED quality scoring system for stream selection AND upgrade logic
         Prevents inconsistencies between initial selection and upgrade decisions
@@ -1006,7 +1027,7 @@ class GoStormSync:
             name = f"{name}_{torrent_hash[-8:]}"
         return name
 
-    def create_bash_style_mkv(self, title: str, hash_value: str, stream_title: str, expect_4k: bool, is_tv: bool = False, season_dir: str = None, file_id: str = "1") -> bool:
+    def create_bash_style_mkv(self, title: str, hash_value: str, stream_title: str, expect_4k: bool, is_tv: bool = False, season_dir: Optional[str] = None, file_id: str = "1") -> bool:
         """Create .mkv file using bash-style approach (immediate, index=1, estimated size)"""
         try:
             # Extract size from stream title (bash approach)
@@ -2474,8 +2495,8 @@ class GoStormSync:
             if prowlarr_streams:
                 self.log("INFO", f"✅ Found {len(prowlarr_streams)} streams via Prowlarr for {imdb_id}")
                 # Use same filtering as Torrentio
-                prowlarr_data = {"streams": prowlarr_streams}
-                filtered = {}
+                prowlarr_data: Dict[str, Any] = {"streams": prowlarr_streams}
+                filtered: Dict[str, Any] = {}
                 if content_type == "movie":
                     filtered = self._filter_movie_streams(prowlarr_data)
                 elif content_type == "series":
@@ -2858,7 +2879,7 @@ class GoStormSync:
             filtered_streams.append(stream)
         
         # Sort by UNIFIED quality scoring system (consistency with movies)
-        def extract_seeders_from_title(title: str) -> int:
+        def extract_seeders_for_sort(title: str) -> int:
             """Extract seeder count from title"""
             match = re.search(r'👤\s*([0-9]+)', title)
             return int(match.group(1)) if match else 0
@@ -2866,7 +2887,7 @@ class GoStormSync:
         # Add quality scores and seeders to all streams
         for stream in filtered_streams:
             title = stream.get("title", "")
-            seeders = extract_seeders_from_title(title)
+            seeders = extract_seeders_for_sort(title)
             name = stream.get("name", "")
             stream["quality_score"] = self.calculate_quality_score(title + " " + name, seeders=seeders)
             stream["seeders"] = seeders  # Store for tie-breaker sorting
@@ -3261,6 +3282,7 @@ class GoStormSync:
         start = time.time()
         last_len = -1
         poll = 0
+        torrent_info = None
         # sequenza di sleep dopo primo get già eseguito fuori: partiamo con 2,3,4,5,6...
         dynamic_sleeps = [2,3,4,5,6,6,6]
         while time.time() - start < max_wait:
@@ -3269,7 +3291,6 @@ class GoStormSync:
                 method="POST",
                 data={"action": "get", "hash": hash_value}
             )
-            torrent_info = None
             if info:
                 try:
                     torrent_info = info.json()
@@ -3292,7 +3313,7 @@ class GoStormSync:
             time.sleep(sleep_time)
             poll += 1
         # Timeout senza mkv
-        return torrent_info if 'torrent_info' in locals() else None, []
+        return torrent_info, []
 
     # ================== CORE INDEX PERSISTENTE ==================
     def _load_core_index(self, path: str) -> dict:
@@ -3708,6 +3729,7 @@ class GoStormSync:
             stream_title = stream.get("title", "")
             info_hash = stream.get("infoHash", "")
             resolution = "4K" if best_stream.get("name", "").startswith("Torrentio\n4k") else "1080p"
+            expect_4k = bool(re.search(r'2160p|4[kK]|UHD', stream_title, re.IGNORECASE))
             
             self.log("INFO", f"Selected best {resolution} stream for {title}: {stream_title[:60]}... (score: {best_score})")
             
@@ -3766,6 +3788,8 @@ class GoStormSync:
                     self.log("ERROR", f"Invalid hash format: {hash_value}")
                     continue
                 self.log("INFO", f"Hash format validated: {hash_value}")
+
+                expect_4k = bool(re.search(r'2160p|4[kK]|UHD', stream_title, re.IGNORECASE))
                 
                 torrent_info = self.get_torrent_info(hash_value)
                 if not torrent_info:
@@ -5363,7 +5387,8 @@ class GoStormSync:
         
         try:
             # Import and run the fixer
-            from tv_episode_fixer import TVEpisodeFixer
+            import importlib
+            TVEpisodeFixer = importlib.import_module("tv_episode_fixer").TVEpisodeFixer
             fixer = TVEpisodeFixer()
             fixer.process_all_shows()
             
@@ -5387,6 +5412,14 @@ class GoStormSync:
         import sys
         import atexit
 
+        flock = getattr(fcntl, 'flock', None)
+        lock_ex = getattr(fcntl, 'LOCK_EX', None)
+        lock_nb = getattr(fcntl, 'LOCK_NB', None)
+
+        if flock is None or lock_ex is None or lock_nb is None:
+            self.log("WARN", "fcntl flock not available on this platform; skipping single-instance lock")
+            return
+
         lock_file = "/tmp/gostorm-sync.lock"
         pid_file = "/tmp/gostorm-sync.pid"
 
@@ -5399,7 +5432,7 @@ class GoStormSync:
 
         # Try to acquire EXCLUSIVE lock (non-blocking)
         try:
-            fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(self._lock_fd.fileno(), lock_ex | lock_nb)
         except IOError:
             # Lock held by another process - check if it's alive (handle stale locks)
             try:
@@ -5417,7 +5450,7 @@ class GoStormSync:
             except (ProcessLookupError, ValueError, FileNotFoundError, PermissionError):
                 # Stale lock - old process crashed without cleanup
                 self.log("WARN", "Stale lock detected (previous instance crashed), forcing acquisition...")
-                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX)  # Blocking acquire
+                flock(self._lock_fd.fileno(), lock_ex)  # Blocking acquire
                 self.log("INFO", "Lock acquired after stale cleanup")
 
         # Lock acquired successfully - write our PID
@@ -5440,12 +5473,16 @@ class GoStormSync:
         import fcntl
         import os
 
+        flock = getattr(fcntl, 'flock', None)
+        lock_un = getattr(fcntl, 'LOCK_UN', None)
+
         lock_file = "/tmp/gostorm-sync.lock"
         pid_file = "/tmp/gostorm-sync.pid"
 
         try:
             if hasattr(self, '_lock_fd') and self._lock_fd:
-                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
+                if flock is not None and lock_un is not None:
+                    flock(self._lock_fd.fileno(), lock_un)
                 self._lock_fd.close()
                 self._lock_fd = None
         except:
