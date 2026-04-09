@@ -1,5 +1,5 @@
-#!/usr/bin/with-contenv bash
-set -euo pipefail
+#!/usr/bin/with-contenv /bin/sh
+set -eu
 
 # Minimal deterministic init:
 # - Ensure all bind-mounted directories exist

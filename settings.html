@@ -720,13 +720,15 @@
                                 <label>Torrentio URL</label>
                                 <input type="text" name="torrentio_url" id="torrentio_url_input"
                                     placeholder="https://torrentio.strem.fun">
-                                <div class="hint" id="torrentio_url_hint">Torrentio base URL (used when Prowlarr is disabled)</div>
+                                <div class="hint" id="torrentio_url_hint">Torrentio base URL (used when Prowlarr is
+                                    disabled)</div>
                             </div>
                         </div>
                         <div class="switch-item" style="margin-top: 12px;">
                             <span>Enable Prowlarr</span>
                             <label class="switch"><input type="checkbox" name="prowlarr_enabled"
-                                    data-nested="prowlarr.enabled" onchange="updateProwlarrState()"><span class="slider"></span></label>
+                                    data-nested="prowlarr.enabled" onchange="updateProwlarrState()"><span
+                                    class="slider"></span></label>
                         </div>
                         <div class="hint" style="margin-bottom: 12px;">Use Prowlarr as indexer; if disabled, uses
                             Torrentio</div>
@@ -1044,6 +1046,12 @@
     </div>
 
     <script>
+        const CONTROL_HOST = window.location.hostname || '127.0.0.1';
+        const GOSTREAM_API_PORT = 8096;
+        const GOSTORM_SETTINGS_PORT = 8090;
+        const gostreamApiBase = `http://${CONTROL_HOST}:${GOSTREAM_API_PORT}`;
+        const gostormSettingsBase = `http://${CONTROL_HOST}:${GOSTORM_SETTINGS_PORT}`;
+
         // --- Restart ---
         async function restartGoStream() {
             const btn = document.getElementById('btn-restart');
@@ -1051,12 +1059,12 @@
             btn.disabled = true;
             btn.textContent = 'Restarting…';
             try {
-                await fetch('/api/restart', { method: 'POST' });
+                await fetch(`${gostreamApiBase}/api/restart`, { method: 'POST' });
             } catch (_) { /* expected: connection drops on restart */ }
             // Poll until back up
             const poll = setInterval(async () => {
                 try {
-                    const r = await fetch('/api/config', { signal: AbortSignal.timeout(2000) });
+                    const r = await fetch(`${gostreamApiBase}/api/config`, { signal: AbortSignal.timeout(2000) });
                     if (r.ok) {
                         clearInterval(poll);
                         btn.disabled = false;
@@ -1220,7 +1228,7 @@
 
         async function loadEngine() {
             try {
-                const res = await fetch('/api/config');
+                const res = await fetch(`${gostreamApiBase}/api/config`);
                 originalEngine = await res.json();
                 const form = document.getElementById('gostream-form');
                 ENGINE_ROOT_KEYS.forEach(k => {
@@ -1324,7 +1332,7 @@
                 url: formData.get('prowlarr_url') || oldProwlarr.url || ""
             };
 
-            const res = await fetch('/api/config', {
+            const res = await fetch(`${gostreamApiBase}/api/config`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data)
@@ -1340,7 +1348,7 @@
 
         async function loadCore() {
             try {
-                const res = await fetch('http://' + window.location.hostname + ':8090/settings', {
+                const res = await fetch(`${gostormSettingsBase}/settings`, {
                     method: 'POST',
                     body: JSON.stringify({ action: 'get' }),
                     headers: { 'Content-Type': 'application/json' }
@@ -1392,7 +1400,7 @@
                 const isUIOn = formData.has(formKey);
                 sets[k] = NEGATIVE_KEYS.includes(k) ? !isUIOn : isUIOn;
             });
-            const res = await fetch('http://' + window.location.hostname + ':8090/settings', {
+            const res = await fetch(`${gostormSettingsBase}/settings`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action: 'set', sets: sets })
@@ -1508,8 +1516,12 @@
 
         async function loadScheduler() {
             const [cfgRes, rtRes] = await Promise.all([
-                fetch('/api/config'),
-                fetch(`${monitorBase}/api/scheduler/status`).catch(() => null)
+                fetch(`${gostreamApiBase}/api/config`),
+                (async () => {
+                    const r1 = await fetch(`${monitorBase}/api/scheduler`).catch(() => null);
+                    if (r1 && r1.ok) return r1;
+                    return await fetch(`${monitorBase}/api/scheduler/status`).catch(() => null);
+                })()
             ]);
             const cfg = await cfgRes.json();
             const sched = cfg.scheduler || {};
@@ -1552,7 +1564,7 @@
             const moviesTime = document.getElementById('sched-movies-time').value.split(':');
             const tvTime = document.getElementById('sched-tv-time').value.split(':');
 
-            const cfgRes = await fetch('/api/config');
+            const cfgRes = await fetch(`${gostreamApiBase}/api/config`);
             const data = await cfgRes.json();
 
             data.scheduler = {
@@ -1575,7 +1587,7 @@
                 }
             };
 
-            const res = await fetch('/api/config', {
+            const res = await fetch(`${gostreamApiBase}/api/config`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data)

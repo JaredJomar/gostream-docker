@@ -9,6 +9,10 @@ REM - Never deletes user data directories
 set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%..") do set "REPO_ROOT=%%~fI"
 set "TEMPLATES_DIR=%SCRIPT_DIR%templates"
+set "TEMP_ROOT=%REPO_ROOT%\temp"
+if not exist "%TEMP_ROOT%" mkdir "%TEMP_ROOT%" >nul 2>&1
+set "TEMP=%TEMP_ROOT%"
+set "TMP=%TEMP_ROOT%"
 
 set "DEFAULT_BASE=%USERPROFILE%\Documents\Docker Stuff"
 set "DEFAULT_STACKS=%USERPROFILE%\Documents\Docker Stuff\Dockge\stacks"
@@ -37,6 +41,14 @@ set "CONFIG_CREATED=0"
 set "CONFIG_CHANGED=0"
 set "CONFIG_BACKUP="
 set "GOSTREAM_METRICS_PORT="
+set "INSTALL_KIND=install"
+set "PORT_POLICY=fixed"
+set "DISCOVERED_STACK_COUNT=0"
+set "DRIVE_LETTER="
+set "EXISTING_PLEX_SERVER=0"
+set "EXISTING_PLEX_TOKEN=0"
+set "PLEX_REUSE_NOTE="
+set "STACK_HAS_COMPOSE=0"
 
 call :main %*
 set "RC=%ERRORLEVEL%"
@@ -177,13 +189,30 @@ if "%NON_INTERACTIVE%"=="1" (
     )
   )
 ) else (
+  echo.
+  echo ================= GoStream Setup Wizard =================
+  echo Tip: Press Enter to accept values shown in [brackets].
+  echo.
+
   call :prompt_mydeploy_preflavor
   if errorlevel 1 exit /b !ERRORLEVEL!
 
   if "!FLAVOR!"=="" call :prompt_flavor
   if not "!USE_MYDEPLOY!"=="1" (
-    if "!BASE_DIR_WIN!"=="" call :prompt_value "Base path" "%DEFAULT_BASE%" BASE_DIR_WIN
-    if "!STACKS_ROOT_WIN!"=="" call :prompt_value "Stacks root path" "%DEFAULT_STACKS%" STACKS_ROOT_WIN
+    if "!BASE_DIR_WIN!"=="" (
+      call :prompt_drive_letter
+      set "BASE_DIR_WIN=!DRIVE_LETTER!:\Documents\Docker Stuff"
+    )
+    if "!STACKS_ROOT_WIN!"=="" set "STACKS_ROOT_WIN=!BASE_DIR_WIN!\Dockge\stacks"
+
+    call :normalize_drive_letter_path "!BASE_DIR_WIN!" BASE_DIR_WIN
+    call :normalize_drive_letter_path "!STACKS_ROOT_WIN!" STACKS_ROOT_WIN
+
+    call :prompt_value "Base path" "!BASE_DIR_WIN!" BASE_DIR_WIN
+    call :prompt_value "Stacks root path" "!STACKS_ROOT_WIN!" STACKS_ROOT_WIN
+
+    call :normalize_drive_letter_path "!BASE_DIR_WIN!" BASE_DIR_WIN
+    call :normalize_drive_letter_path "!STACKS_ROOT_WIN!" STACKS_ROOT_WIN
 
     call :prompt_source_mode
     if errorlevel 1 exit /b !ERRORLEVEL!
@@ -192,8 +221,18 @@ if "%NON_INTERACTIVE%"=="1" (
     if errorlevel 1 exit /b !ERRORLEVEL!
 
     if /i "!FLAVOR!"=="plex" (
-      set /p "PLEX_CLAIM=Plex claim token (optional; blank to skip): "
-      call :prompt_plex_import
+      call :detect_existing_plex_state "!BASE_DIR_WIN!"
+      if "!EXISTING_PLEX_SERVER!"=="1" if "!EXISTING_PLEX_TOKEN!"=="1" (
+        set "PLEX_IMPORT=0"
+        set "PLEX_CLAIM="
+        set "PLEX_REUSE_NOTE=Existing Plex server/token detected in container data; Windows import skipped to preserve server state."
+        echo.
+        echo [plex] Existing Plex server detected with token. Reusing existing server token; no data will be lost.
+        echo [plex] Windows Plex import disabled for rebuild safety.
+      ) else (
+        set /p "PLEX_CLAIM=Plex claim token (optional; blank to skip): "
+        call :prompt_plex_import
+      )
       if errorlevel 1 exit /b !ERRORLEVEL!
     )
   )
@@ -203,13 +242,6 @@ if "%NON_INTERACTIVE%"=="1" (
    echo ERROR: Invalid flavor: %FLAVOR%
    goto bad_args
  )
-
- REM -------------------------
- REM Preflight: stop Plex (Windows + container) before any deploy/generation
- REM - Must run even when --no-deploy is specified
- REM -------------------------
- call :preflight_stop_plex
- if errorlevel 1 exit /b !ERRORLEVEL!
 
  if "%USE_MYDEPLOY%"=="1" (
    REM my-deploy stack root: use --stacks if provided, else DEFAULT_STACKS (no prompting)
@@ -247,6 +279,11 @@ if not exist "%REPO_ROOT%\config.json.example" (
 REM Normalize base/stacks root to full Windows paths
 call :fullpath "%BASE_DIR_WIN%" BASE_DIR_WIN
 call :fullpath "%STACKS_ROOT_WIN%" STACKS_ROOT_WIN
+call :normalize_drive_letter_path "%BASE_DIR_WIN%" BASE_DIR_WIN
+call :normalize_drive_letter_path "%STACKS_ROOT_WIN%" STACKS_ROOT_WIN
+
+call :discover_existing_stacks "%STACKS_ROOT_WIN%"
+call :show_base_inventory "%BASE_DIR_WIN%"
 
 if "%USE_EXISTING_FILES%"=="1" (
   call :fullpath "%EXISTING_COMPOSE_FILE%" EXISTING_COMPOSE_FILE
@@ -268,6 +305,13 @@ if /i "%FLAVOR%"=="plex" (
   set "CONTAINER_NAME=gostream-jellyfin"
 )
 set "STACK_DIR_WIN=%STACKS_ROOT_WIN%\%CONTAINER_NAME%"
+if exist "%STACK_DIR_WIN%\compose.yaml" (
+  set "INSTALL_KIND=rebuild"
+  set "STACK_HAS_COMPOSE=1"
+) else (
+  set "INSTALL_KIND=install"
+  set "STACK_HAS_COMPOSE=0"
+)
 
 echo.
 echo Target paths:
@@ -287,6 +331,14 @@ call :ensure_dir "%BASE_DIR_WIN%\gostream-mkv-real\movies"
 call :ensure_dir "%BASE_DIR_WIN%\gostream-mkv-real\tv"
 call :ensure_dir "%BASE_DIR_WIN%\%CONTAINER_NAME%\config"
 call :ensure_dir "%BASE_DIR_WIN%\%CONTAINER_NAME%\transcode"
+
+if /i "%FLAVOR%"=="plex" (
+  call :detect_existing_plex_state "%BASE_DIR_WIN%"
+  if "!EXISTING_PLEX_SERVER!"=="1" if "!EXISTING_PLEX_TOKEN!"=="1" (
+    set "PLEX_IMPORT=0"
+    if "!PLEX_REUSE_NOTE!"=="" set "PLEX_REUSE_NOTE=Existing Plex server/token detected in container data; Windows import skipped to preserve server state."
+  )
+)
 
 REM Ensure config.json exists
 set "CONFIG_PATH=%BASE_DIR_WIN%\gostream-mkv-real\config\config.json"
@@ -320,6 +372,23 @@ if not exist "%CONFIG_PATH%" (
  ) else (
    set "MEDIA_CONTAINER_PORT=8096"
  )
+
+if /i "%INSTALL_KIND%"=="rebuild" (
+  call :load_existing_ports "%STACK_DIR_WIN%\.env"
+  if "!PORT_POLICY!"=="fixed" set "PORT_POLICY=rebuild-fixed"
+) else (
+  call :auto_select_install_ports_if_needed
+)
+
+REM -------------------------
+REM Preflight: stop Plex (Windows + container) before deploy/generation
+REM - Must run even when --no-deploy is specified
+REM -------------------------
+call :preflight_stop_plex
+if errorlevel 1 exit /b !ERRORLEVEL!
+
+call :assert_selected_ports_free
+if errorlevel 1 exit /b !ERRORLEVEL!
 
 REM Normalize BASE_DIR and STACK_DIR for .env (forward slashes)
 call :norm_fwd "%BASE_DIR_WIN%" BASE_DIR_FWD
@@ -365,10 +434,13 @@ REM Summary
 echo.
 echo ===================== SUMMARY =====================
 echo Flavor              : %FLAVOR%
+echo Run kind            : %INSTALL_KIND%
+echo Port policy         : %PORT_POLICY%
 echo Mode                : %MODE%
 echo Base (Windows)      : %BASE_DIR_WIN%
 echo Stacks root (Win)   : %STACKS_ROOT_WIN%
 echo Stack dir (Win)     : %STACK_DIR_WIN%
+echo Stacks with compose : %DISCOVERED_STACK_COUNT%
 echo Container name      : %CONTAINER_NAME%
 if "%USE_EXISTING_FILES%"=="1" (
   echo Source mode        : existing user files
@@ -378,7 +450,7 @@ if "%USE_EXISTING_FILES%"=="1" (
   echo Source mode        : built-in templates ^(docker-windows/templates^)
 )
 echo.
- echo Ports (host -> container):
+ echo Ports (host -^> container):
  echo   MEDIA_SERVER       : %MEDIA_HOST_PORT% ^> %MEDIA_CONTAINER_PORT%
  echo   GOSTORM_API        : %GOSTORM_HOST_PORT% ^> 8090
  echo   HEALTH_MONITOR     : %HEALTH_HOST_PORT% ^> 8095
@@ -399,7 +471,9 @@ if /i "%FLAVOR%"=="plex" (
   ) else (
     echo Plex import        : NO
   )
+  if not "%PLEX_REUSE_NOTE%"=="" echo Plex reuse note    : %PLEX_REUSE_NOTE%
 )
+echo Temp folder         : %TEMP_ROOT%
 echo ===================================================
 
 exit /b 0
@@ -447,14 +521,31 @@ REM -------------------------
 REM Stop Docker containers (if they exist)
 call :stop_docker_container_if_exists "gostream-plex"
 call :stop_docker_container_if_exists "gostream-jellyfin"
+call :remove_docker_container_if_exists "gostream-plex"
+call :remove_docker_container_if_exists "gostream-jellyfin"
 
 REM Stop Windows Plex Media Server process
 call :stop_windows_plex_media_server
 if errorlevel 1 exit /b !ERRORLEVEL!
 
-REM Verify fixed ports are now free (abort; do not auto-change)
-call :assert_fixed_ports_free
-if errorlevel 1 exit /b !ERRORLEVEL!
+exit /b 0
+
+:assert_selected_ports_free
+set "_portsFailed=0"
+call :assert_port_free %MEDIA_HOST_PORT%
+if errorlevel 1 set "_portsFailed=1"
+call :assert_port_free %GOSTORM_HOST_PORT%
+if errorlevel 1 set "_portsFailed=1"
+call :assert_port_free %HEALTH_HOST_PORT%
+if errorlevel 1 set "_portsFailed=1"
+call :assert_port_free %METRICS_HOST_PORT%
+if errorlevel 1 set "_portsFailed=1"
+
+if "%_portsFailed%"=="1" (
+  echo.
+  echo ERROR: One or more selected host ports are in use. Aborting.
+  exit /b 3
+)
 
 exit /b 0
 
@@ -510,6 +601,25 @@ if errorlevel 1 exit /b 0
 echo.
 echo [preflight] Stopping Docker container "%_name%" (if running)...
 docker stop -t 10 "%_name%" >nul 2>&1
+
+exit /b 0
+
+:remove_docker_container_if_exists
+set "_name=%~1"
+if "%_name%"=="" exit /b 0
+
+where docker >nul 2>&1
+if errorlevel 1 exit /b 0
+
+docker container inspect "%_name%" >nul 2>&1
+if errorlevel 1 exit /b 0
+
+echo [preflight] Removing existing Docker container "%_name%" for clean rebuild...
+docker rm -f "%_name%" >nul 2>&1
+if errorlevel 1 (
+  echo ERROR: Failed to remove existing container "%_name%".
+  exit /b 1
+)
 
 exit /b 0
 
@@ -633,6 +743,34 @@ goto prompt_mydeploy_preflavor
 if "%USE_EXISTING_FILES%"=="1" if not "%EXISTING_COMPOSE_FILE%"=="" if not "%EXISTING_DOCKERFILE%"=="" exit /b 0
 
 echo.
+if /i "%FLAVOR%"=="plex" (
+  set "_defaultName=gostream-plex"
+) else (
+  set "_defaultName=gostream-jellyfin"
+)
+set "_defaultCompose=!STACKS_ROOT_WIN!\!_defaultName!\compose.yaml"
+set "_defaultDockerfile=!STACKS_ROOT_WIN!\!_defaultName!\Dockerfile"
+
+if exist "!_defaultCompose!" if exist "!_defaultDockerfile!" (
+  echo Found existing stack files for !FLAVOR!:
+  echo   !_defaultCompose!
+  echo   !_defaultDockerfile!
+  set "_reuseAns="
+  set /p "_reuseAns=Reuse these files? [Y/N] (default Y): "
+  if "!_reuseAns!"=="" set "_reuseAns=Y"
+  if /i "!_reuseAns!"=="Y" (
+    set "USE_EXISTING_FILES=1"
+    set "EXISTING_COMPOSE_FILE=!_defaultCompose!"
+    set "EXISTING_DOCKERFILE=!_defaultDockerfile!"
+    echo Reusing existing stack files.
+    exit /b 0
+  )
+  if /i not "!_reuseAns!"=="N" (
+    echo Invalid choice; continuing with manual source selection.
+  )
+  echo.
+)
+
 set "_myCompose=%SCRIPT_DIR%my-deploy\my-deploy.compose.yaml"
 set "_myDockerfile=%SCRIPT_DIR%my-deploy\my-deploy.Dockerfile"
 if not "%MYDEPLOY_PREASK%"=="1" if exist "%_myCompose%" if exist "%_myDockerfile%" (
@@ -665,13 +803,19 @@ if "%_srcans%"=="1" (
 )
 if "%_srcans%"=="2" (
   set "USE_EXISTING_FILES=1"
-  if /i "%FLAVOR%"=="plex" (
-    set "_defaultName=gostream-plex"
-  ) else (
-    set "_defaultName=gostream-jellyfin"
+  set "_defaultCompose=!STACKS_ROOT_WIN!\!_defaultName!\compose.yaml"
+  set "_defaultDockerfile=!STACKS_ROOT_WIN!\!_defaultName!\Dockerfile"
+
+  REM If standard stack files already exist, use them automatically.
+  if exist "!_defaultCompose!" if exist "!_defaultDockerfile!" (
+    set "EXISTING_COMPOSE_FILE=!_defaultCompose!"
+    set "EXISTING_DOCKERFILE=!_defaultDockerfile!"
+    echo Using existing stack files:
+    echo   Compose   : !EXISTING_COMPOSE_FILE!
+    echo   Dockerfile: !EXISTING_DOCKERFILE!
+    exit /b 0
   )
-  set "_defaultCompose=%STACKS_ROOT_WIN%\%_defaultName%\compose.yaml"
-  set "_defaultDockerfile=%STACKS_ROOT_WIN%\%_defaultName%\Dockerfile"
+
   call :prompt_value "Existing compose file path" "%_defaultCompose%" EXISTING_COMPOSE_FILE
   call :prompt_value "Existing Dockerfile path" "%_defaultDockerfile%" EXISTING_DOCKERFILE
   if not exist "%EXISTING_COMPOSE_FILE%" (
@@ -705,6 +849,14 @@ goto prompt_runtime_options
 :prompt_plex_import
 set "_default=N"
 if exist "%LOCALAPPDATA%\Plex Media Server" set "_default=Y"
+if "%EXISTING_PLEX_SERVER%"=="1" if "%EXISTING_PLEX_TOKEN%"=="1" (
+  echo.
+  echo [plex] Existing Plex server+token found in container data.
+  echo [plex] Reusing existing server token; Windows import skipped.
+  set "PLEX_IMPORT=0"
+  set "PLEX_REUSE_NOTE=Existing Plex server/token detected in container data; Windows import skipped to preserve server state."
+  exit /b 0
+)
 echo.
 set "_ans="
 set /p "_ans=Import existing Plex data from Windows? [Y/N] (default %_default%): "
@@ -731,6 +883,150 @@ set "_out=%~2"
 for %%I in ("%_in%") do set "%_out%=%%~fI"
 exit /b 0
 
+:normalize_drive_letter_path
+set "_in=%~1"
+set "_out=%~2"
+set "__PATH_IN=%_in%"
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=[System.IO.Path]::GetFullPath($env:__PATH_IN); if($p.Length -ge 2 -and $p[1] -eq ':'){ $p=$p.Substring(0,1).ToUpperInvariant()+$p.Substring(1) }; $p"`) do set "%_out%=%%I"
+set "__PATH_IN="
+exit /b 0
+
+:prompt_drive_letter
+set "_defdrv=%HOMEDRIVE%"
+if "%_defdrv%"=="" set "_defdrv=C:"
+set "_defdrv=%_defdrv::=%"
+set "_defdrv=%_defdrv:~0,1%"
+set "_ans="
+echo.
+set /p "_ans=Drive letter for Documents\Docker Stuff [%_defdrv%]: "
+if "%_ans%"=="" set "_ans=%_defdrv%"
+set "__DRV_IN=%_ans%"
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$d=$env:__DRV_IN; $d=$d.Trim(); if($d.EndsWith(':')){ $d=$d.Substring(0,$d.Length-1) }; if($d.Length -lt 1){ exit 1 }; $c=$d.Substring(0,1).ToUpperInvariant(); if($c -notmatch '^[A-Z]$'){ exit 1 }; $c"`) do set "DRIVE_LETTER=%%I"
+set "__DRV_IN="
+if "%DRIVE_LETTER%"=="" (
+  echo ERROR: Invalid drive letter.
+  exit /b 1
+)
+if not exist "%DRIVE_LETTER%:\" (
+  echo ERROR: Drive %DRIVE_LETTER%: does not exist.
+  exit /b 1
+)
+exit /b 0
+
+:discover_existing_stacks
+set "_stacksRoot=%~1"
+set "DISCOVERED_STACK_COUNT=0"
+echo.
+echo [scan] Existing stack folders with compose.yaml in %_stacksRoot%:
+if not exist "%_stacksRoot%" (
+  echo   - none (stacks root does not exist yet)
+  exit /b 0
+)
+for /f "usebackq delims=" %%F in (`dir /b /s "%_stacksRoot%\*\compose.yaml" 2^>nul`) do (
+  set /a DISCOVERED_STACK_COUNT+=1
+  for %%P in ("%%~dpF.") do echo   - %%~nxP
+)
+if "%DISCOVERED_STACK_COUNT%"=="0" echo   - none
+exit /b 0
+
+:show_base_inventory
+set "_base=%~1"
+echo.
+echo [scan] Current entries in %_base%:
+if not exist "%_base%" (
+  echo   - base path does not exist yet
+  exit /b 0
+)
+for /f "delims=" %%F in ('dir /b "%_base%" 2^>nul') do echo   - %%F
+exit /b 0
+
+:detect_existing_plex_state
+set "_base=%~1"
+set "EXISTING_PLEX_SERVER=0"
+set "EXISTING_PLEX_TOKEN=0"
+set "_prefs=%_base%\gostream-plex\config\Library\Application Support\Plex Media Server\Preferences.xml"
+set "_cfg=%_base%\gostream-mkv-real\config\config.json"
+if exist "%_prefs%" set "EXISTING_PLEX_SERVER=1"
+
+set "__CFG=%_cfg%"
+set "__PREFS=%_prefs%"
+for /f "usebackq tokens=1* delims==" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $cfg=$env:__CFG; $prefs=$env:__PREFS; $hasToken=$false; if(Test-Path -LiteralPath $cfg){ try { $obj=Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Json; if($obj.plex -and $obj.plex.token -and ($obj.plex.token.ToString().Trim()).Length -gt 0){ $hasToken=$true } } catch {} }; if((-not $hasToken) -and (Test-Path -LiteralPath $prefs)){ try { [xml]$xml=Get-Content -Raw -LiteralPath $prefs; $val=$xml.Preferences.PlexOnlineToken; if($val -and $val.Trim().Length -gt 0){ $hasToken=$true } } catch {} }; Write-Output ('EXISTING_PLEX_TOKEN=' + ($(if($hasToken){'1'}else{'0'}))) }"`) do (
+  if /i "%%A"=="EXISTING_PLEX_TOKEN" set "EXISTING_PLEX_TOKEN=%%B"
+)
+set "__CFG="
+set "__PREFS="
+exit /b 0
+
+:load_existing_ports
+set "_envPath=%~1"
+if not exist "%_envPath%" exit /b 0
+set "_loaded=0"
+for /f "usebackq tokens=1* delims==" %%A in ("%_envPath%") do (
+  if /i "%%A"=="MEDIA_HOST_PORT" set "MEDIA_HOST_PORT=%%B"
+  if /i "%%A"=="GOSTORM_HOST_PORT" set "GOSTORM_HOST_PORT=%%B"
+  if /i "%%A"=="HEALTH_HOST_PORT" set "HEALTH_HOST_PORT=%%B"
+  if /i "%%A"=="GOSTREAM_METRICS_PORT" set "METRICS_HOST_PORT=%%B"
+  if /i "%%A"=="MEDIA_HOST_PORT" set "_loaded=1"
+  if /i "%%A"=="GOSTORM_HOST_PORT" set "_loaded=1"
+  if /i "%%A"=="HEALTH_HOST_PORT" set "_loaded=1"
+  if /i "%%A"=="GOSTREAM_METRICS_PORT" set "_loaded=1"
+)
+if "%_loaded%"=="1" set "PORT_POLICY=reuse-existing"
+exit /b 0
+
+:auto_select_install_ports_if_needed
+set "_needsAuto=0"
+call :is_port_in_use %MEDIA_HOST_PORT% _p
+if "%_p%"=="1" set "_needsAuto=1"
+call :is_port_in_use %GOSTORM_HOST_PORT% _p
+if "%_p%"=="1" set "_needsAuto=1"
+call :is_port_in_use %HEALTH_HOST_PORT% _p
+if "%_p%"=="1" set "_needsAuto=1"
+call :is_port_in_use %METRICS_HOST_PORT% _p
+if "%_p%"=="1" set "_needsAuto=1"
+
+if "%_needsAuto%"=="0" (
+  set "PORT_POLICY=fixed"
+  exit /b 0
+)
+
+echo.
+echo [ports] Default install ports are in use by another service.
+echo [ports] Auto-selecting free host ports for initial install only.
+call :find_next_free_port 32302 MEDIA_HOST_PORT
+if errorlevel 1 exit /b 1
+call :find_next_free_port 8090 GOSTORM_HOST_PORT
+if errorlevel 1 exit /b 1
+call :find_next_free_port 8095 HEALTH_HOST_PORT
+if errorlevel 1 exit /b 1
+call :find_next_free_port 8096 METRICS_HOST_PORT
+if errorlevel 1 exit /b 1
+set "PORT_POLICY=install-auto-selected"
+exit /b 0
+
+:is_port_in_use
+set "_port=%~1"
+set "_outvar=%~2"
+set "%_outvar%=0"
+set "__CHECK_PORT=%_port%"
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $port=[int]$env:__CHECK_PORT; $used=$false; try { $listeners=[System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners(); if($listeners | Where-Object { $_.Port -eq $port }){ $used=$true } } catch {}; if(-not $used){ try { $ids=docker ps -q 2^> $null; foreach($id in $ids){ if([string]::IsNullOrWhiteSpace($id)){ continue }; try { $insp=docker inspect $id 2^> $null | ConvertFrom-Json; if($null -eq $insp -or $insp.Count -lt 1){ continue }; $ports=$insp[0].NetworkSettings.Ports; if($null -eq $ports){ continue }; foreach($prop in $ports.PSObject.Properties){ $bindings=$prop.Value; if($null -eq $bindings){ continue }; foreach($b in $bindings){ if($null -ne $b.HostPort -and $b.HostPort -match '^[0-9]+$' -and [int]$b.HostPort -eq $port){ $used=$true; break } }; if($used){ break } }; if($used){ break } } catch {} } } catch {} }; if($used){ '1' } else { '0' } }"`) do set "%_outvar%=%%I"
+set "__CHECK_PORT="
+exit /b 0
+
+:find_next_free_port
+set "_start=%~1"
+set "_out=%~2"
+set "__PORT_START=%_start%"
+set "_selected="
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $start=[int]$env:__PORT_START; $used=[System.Collections.Generic.HashSet[int]]::new(); try { $listeners=[System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners(); foreach($l in $listeners){ [void]$used.Add([int]$l.Port) } } catch {}; try { $ids=docker ps -q 2^> $null; foreach($id in $ids){ if([string]::IsNullOrWhiteSpace($id)){ continue }; try { $insp=docker inspect $id 2^> $null | ConvertFrom-Json; if($null -eq $insp -or $insp.Count -lt 1){ continue }; $ports=$insp[0].NetworkSettings.Ports; if($null -eq $ports){ continue }; foreach($prop in $ports.PSObject.Properties){ $bindings=$prop.Value; if($null -eq $bindings){ continue }; foreach($b in $bindings){ if($null -ne $b.HostPort -and $b.HostPort -match '^[0-9]+$'){ [void]$used.Add([int]$b.HostPort) } } } } catch {} } } catch {}; for($p=$start; $p -le 65535; $p++){ if(-not $used.Contains($p)){ Write-Output $p; exit 0 } }; exit 1 }"`) do set "_selected=%%I"
+set "__PORT_START="
+if "%_selected%"=="" (
+  echo ERROR: Failed to find free port starting from %_start%
+  exit /b 1
+)
+set "%_out%=%_selected%"
+exit /b 0
+
 :norm_fwd
 set "_in=%~1"
 set "_out=%~2"
@@ -748,7 +1044,7 @@ set "__CFG=%_cfg%"
 set "__BAK=%_backupDir%"
 set "__FLAVOR=%_flavor%"
 
- for /f "usebackq tokens=1* delims==" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $cfg=$env:__CFG; $backupDir=$env:__BAK; $flavor=$env:__FLAVOR; if(-not (Test-Path -LiteralPath $cfg)) { throw 'config.json missing' }; $raw=Get-Content -Raw -LiteralPath $cfg; $obj=$raw | ConvertFrom-Json; $changed=$false; if($null -eq $obj.physical_source_path -or $obj.physical_source_path -ne '/gostream/source'){ $obj.physical_source_path='/gostream/source'; $changed=$true }; if($null -eq $obj.fuse_mount_path -or $obj.fuse_mount_path -ne '/gostream/mount'){ $obj.fuse_mount_path='/gostream/mount'; $changed=$true }; if($flavor -eq 'jellyfin'){ $desiredMetrics=8097; if($null -eq $obj.metrics_port -or [int]$obj.metrics_port -ne $desiredMetrics){ $obj.metrics_port=$desiredMetrics; $changed=$true } }; if($flavor -eq 'plex'){ $desiredMetrics=8096; if($null -eq $obj.metrics_port -or [int]$obj.metrics_port -ne $desiredMetrics){ $obj.metrics_port=$desiredMetrics; $changed=$true } }; $bak=''; if($changed -and $flavor -eq 'jellyfin'){ New-Item -ItemType Directory -Force -Path $backupDir | Out-Null; $ts=Get-Date -Format 'yyyyMMdd-HHmmss'; $bak=Join-Path $backupDir ('config.json.'+$ts+'.bak'); Copy-Item -LiteralPath $cfg -Destination $bak -Force }; if($changed){ ($obj | ConvertTo-Json -Depth 64) | Set-Content -LiteralPath $cfg -Encoding UTF8 }; Write-Output ('CONFIG_CHANGED=' + ($(if($changed){'1'}else{'0'}))); Write-Output ('CONFIG_BACKUP=' + $bak); Write-Output ('GOSTREAM_METRICS_PORT=' + ([int]$obj.metrics_port)) }"`) do (
+ for /f "usebackq tokens=1* delims==" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $cfg=$env:__CFG; $backupDir=$env:__BAK; $flavor=$env:__FLAVOR; if(-not (Test-Path -LiteralPath $cfg)) { throw 'config.json missing' }; $raw=Get-Content -Raw -LiteralPath $cfg; $obj=$raw | ConvertFrom-Json; $changed=$false; $bytes=[System.IO.File]::ReadAllBytes($cfg); $hadBom=($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191); if($hadBom){ $changed=$true }; if($null -eq $obj.physical_source_path -or $obj.physical_source_path -ne '/gostream/source'){ $obj.physical_source_path='/gostream/source'; $changed=$true }; if($null -eq $obj.fuse_mount_path -or $obj.fuse_mount_path -ne '/gostream/mount'){ $obj.fuse_mount_path='/gostream/mount'; $changed=$true }; if($flavor -eq 'jellyfin'){ $desiredMetrics=8097; if($null -eq $obj.metrics_port -or [int]$obj.metrics_port -ne $desiredMetrics){ $obj.metrics_port=$desiredMetrics; $changed=$true } }; if($flavor -eq 'plex'){ $desiredMetrics=8096; if($null -eq $obj.metrics_port -or [int]$obj.metrics_port -ne $desiredMetrics){ $obj.metrics_port=$desiredMetrics; $changed=$true } }; $bak=''; if($changed -and $flavor -eq 'jellyfin'){ New-Item -ItemType Directory -Force -Path $backupDir | Out-Null; $ts=Get-Date -Format 'yyyyMMdd-HHmmss'; $bak=Join-Path $backupDir ('config.json.'+$ts+'.bak'); Copy-Item -LiteralPath $cfg -Destination $bak -Force }; if($changed){ $json=($obj | ConvertTo-Json -Depth 64); $enc=New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText($cfg,$json,$enc) }; Write-Output ('CONFIG_CHANGED=' + ($(if($changed){'1'}else{'0'}))); Write-Output ('CONFIG_BACKUP=' + $bak); Write-Output ('GOSTREAM_METRICS_PORT=' + ([int]$obj.metrics_port)) }"`) do (
   if /i "%%A"=="CONFIG_CHANGED" set "CONFIG_CHANGED=%%B"
   if /i "%%A"=="CONFIG_BACKUP" set "CONFIG_BACKUP=%%B"
   if /i "%%A"=="GOSTREAM_METRICS_PORT" set "GOSTREAM_METRICS_PORT=%%B"
@@ -773,7 +1069,11 @@ set "_existingDockerfile=%~8"
 REM compose.yaml
 echo [stack] Writing compose.yaml
 if "%_useExisting%"=="1" (
-  copy /y "%_existingCompose%" "%_stackDir%\compose.yaml" >nul
+  if /i "%_existingCompose%"=="%_stackDir%\compose.yaml" (
+    echo [stack] compose.yaml already in target; keeping existing file
+  ) else (
+    copy /y "%_existingCompose%" "%_stackDir%\compose.yaml" >nul
+  )
 ) else (
   copy /y "%TEMPLATES_DIR%\compose.yaml.tmpl" "%_stackDir%\compose.yaml" >nul
 )
@@ -785,7 +1085,11 @@ if errorlevel 1 (
 REM Dockerfile
 echo [stack] Writing Dockerfile
 if "%_useExisting%"=="1" (
-  copy /y "%_existingDockerfile%" "%_stackDir%\Dockerfile" >nul
+  if /i "%_existingDockerfile%"=="%_stackDir%\Dockerfile" (
+    echo [stack] Dockerfile already in target; keeping existing file
+  ) else (
+    copy /y "%_existingDockerfile%" "%_stackDir%\Dockerfile" >nul
+  )
 ) else (
   if /i "%_flavor%"=="plex" (
     copy /y "%TEMPLATES_DIR%\Dockerfile.plex.tmpl" "%_stackDir%\Dockerfile" >nul
@@ -805,11 +1109,21 @@ if errorlevel 8 (
   echo ERROR: Failed to copy custom-services templates
   exit /b 1
 )
+call :normalize_lf_tree "%_stackDir%\custom-services"
+if errorlevel 1 (
+  echo ERROR: Failed to normalize custom-services line endings
+  exit /b 1
+)
 
 echo [stack] Copying custom-cont-init
 robocopy "%TEMPLATES_DIR%\custom-cont-init" "%_stackDir%\custom-cont-init" /E /R:2 /W:2 /NFL /NDL /NJH /NJS /NP
 if errorlevel 8 (
   echo ERROR: Failed to copy custom-cont-init templates
+  exit /b 1
+)
+call :normalize_lf_tree "%_stackDir%\custom-cont-init"
+if errorlevel 1 (
+  echo ERROR: Failed to normalize custom-cont-init line endings
   exit /b 1
 )
 
@@ -934,6 +1248,14 @@ exit /b 0
 set "_src=%~1"
 set "_dest=%~2"
 
+if "%EXISTING_PLEX_SERVER%"=="1" if "%EXISTING_PLEX_TOKEN%"=="1" (
+  echo.
+  echo [plex] Existing Plex server+token found. Reusing server token; skipping Windows import.
+  set "PLEX_IMPORT=0"
+  if "%PLEX_REUSE_NOTE%"=="" set "PLEX_REUSE_NOTE=Existing Plex server/token detected in container data; Windows import skipped to preserve server state."
+  exit /b 0
+)
+
 echo.
 echo WARNING: Windows Plex plugins/scanners may not work on Linux containers.
 
@@ -1004,6 +1326,9 @@ if not "%_rc%"=="0" (
   exit /b %_rc%
 )
 
+call :ensure_container_running "%CONTAINER_NAME%"
+if errorlevel 1 exit /b !ERRORLEVEL!
+
 exit /b 0
 
 :deploy_existing_compose
@@ -1032,6 +1357,37 @@ if not "%_rc%"=="0" (
   exit /b %_rc%
 )
 
+call :ensure_container_running "gostream-plex"
+if errorlevel 1 exit /b !ERRORLEVEL!
+
+exit /b 0
+
+:ensure_container_running
+set "_name=%~1"
+if "%_name%"=="" exit /b 1
+
+set "_isRunning="
+for /f "usebackq delims=" %%S in (`docker inspect -f "{{.State.Running}}" "%_name%" 2^>nul`) do set "_isRunning=%%S"
+if /i "%_isRunning%"=="true" (
+  echo [deploy] Container "%_name%" is running.
+  exit /b 0
+)
+
+echo [deploy] Container "%_name%" is not running. Starting it now...
+docker start "%_name%" >nul 2>&1
+if errorlevel 1 (
+  echo ERROR: Failed to start container "%_name%" after rebuild.
+  exit /b 1
+)
+
+set "_isRunning="
+for /f "usebackq delims=" %%S in (`docker inspect -f "{{.State.Running}}" "%_name%" 2^>nul`) do set "_isRunning=%%S"
+if /i not "%_isRunning%"=="true" (
+  echo ERROR: Container "%_name%" did not remain running after start.
+  exit /b 1
+)
+
+echo [deploy] Container "%_name%" started successfully.
 exit /b 0
 
 :materialize_mydeploy_stack
@@ -1068,4 +1424,16 @@ exit /b 0
 set "_d=%~1"
 if "%_d%"=="" exit /b 1
 if not exist "%_d%" mkdir "%_d%" >nul 2>&1
+exit /b 0
+
+:normalize_lf_tree
+set "_root=%~1"
+if "%_root%"=="" exit /b 1
+if not exist "%_root%" exit /b 0
+
+set "__NORM_ROOT=%_root%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $root=$env:__NORM_ROOT; Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $p=$_.FullName; $text=[System.IO.File]::ReadAllText($p); $text=$text.Replace(([string][char]13+[char]10),([string][char]10)).Replace(([string][char]13),([string][char]10)); $enc=New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText($p,$text,$enc) } }" >nul
+set "_rc=%ERRORLEVEL%"
+set "__NORM_ROOT="
+if not "%_rc%"=="0" exit /b %_rc%
 exit /b 0

@@ -130,7 +130,16 @@ var readBufferPool *sync.Pool
 var reImdbID = regexp.MustCompile(`"imdb://(tt\d+)"`)
 var reEmptyNumber = regexp.MustCompile(`"(\w+)":\s*,`)
 
-var activeHandles sync.Map      // key: *MkvHandle, value: bool
+func writeAPIResponseHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+}
+
+// V226: Track active handles for Idle Reader Cleanup (Unified)
+var activeHandles sync.Map // key: *MkvHandle, value: bool
+
+// V227: Deduplicate prefetch goroutines
 var inFlightPrefetches sync.Map // key: "path:offset", value: bool
 var activePumps sync.Map        // Map[string]*NativePumpState — one pump per file path
 var pumpTimers sync.Map         // key: path, value: *time.Timer
@@ -3027,6 +3036,11 @@ func main() {
 	})
 
 	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		writeAPIResponseHeaders(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.Method == "GET" {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(globalConfig)
@@ -3088,6 +3102,11 @@ func main() {
 	})
 
 	http.HandleFunc("/api/restart", func(w http.ResponseWriter, r *http.Request) {
+		writeAPIResponseHeaders(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", 405)
 			return
