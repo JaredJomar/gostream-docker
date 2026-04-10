@@ -207,7 +207,7 @@ func LoadConfig() Config {
 	// 1. Initial Defaults (V138 Gold Standard)
 	cfg := Config{
 		MasterConcurrencyLimit: 25,
-		ReadAheadBudgetMB:      512,
+		ReadAheadBudgetMB:      256,
 		MetadataCacheSizeMB:    50, // Default 50MB for metadata
 		WriteBufferSizeKB:      64,
 		ReadBufferSizeKB:       64,
@@ -230,7 +230,7 @@ func LoadConfig() Config {
 
 		CacheCleanupIntervalMin: 5,
 		MaxCacheEntries:         10000,
-		DiskWarmupQuotaGB:       32,
+		DiskWarmupQuotaGB:       15,
 		WarmupHeadSizeMB:        64,
 
 		Scheduler: SchedulerConfig{
