@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -103,7 +104,7 @@ func (c *Client) doFetch(ctx context.Context, url string) ([]Stream, error) {
 	}
 
 	if resp.StatusCode == 403 || strings.Contains(string(data), "cloudflare") {
-		return nil, fmt.Errorf("cloudflare blocked")
+		return c.doFetchViaCurl(ctx, url)
 	}
 
 	var result struct {
@@ -122,6 +123,32 @@ func (c *Client) doFetch(ctx context.Context, url string) ([]Stream, error) {
 		streams = append(streams, s)
 	}
 
+	return streams, nil
+}
+
+// doFetchViaCurl is a fallback for when Go's HTTP client is blocked by Cloudflare.
+// curl uses a browser-like TLS fingerprint that bypasses the challenge.
+func (c *Client) doFetchViaCurl(ctx context.Context, url string) ([]Stream, error) {
+	out, err := exec.CommandContext(ctx, "curl", "-s", "-L",
+		"-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+		url).Output()
+	if err != nil {
+		return nil, fmt.Errorf("curl fallback: %w", err)
+	}
+	var result struct {
+		Streams []json.RawMessage `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, fmt.Errorf("curl fallback parse: %w", err)
+	}
+	var streams []Stream
+	for _, raw := range result.Streams {
+		s, err := parseStream(raw)
+		if err != nil {
+			continue
+		}
+		streams = append(streams, s)
+	}
 	return streams, nil
 }
 
