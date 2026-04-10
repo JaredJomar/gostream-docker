@@ -27,7 +27,7 @@
   "blocklist_url": "https://github.com/Naunter/BT_BlockLists/raw/master/bt_blocklists.gz",
   "physical_source_path": "/mnt/gostream-mkv-real",
   "fuse_mount_path": "/mnt/gostream-mkv-virtual",
-  "disk_warmup_quota_gb": 32,
+  "disk_warmup_quota_gb": 15,
   "warmup_head_size_mb": 64,
   "natpmp": {
     "enabled": false,
