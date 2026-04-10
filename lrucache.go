@@ -141,6 +141,9 @@ func (c *simpleLRUCache) Get(key string) (*Metadata, bool) {
 		return nil, false
 	}
 
+	// Store value before dropping lock to prevent data race with Put
+	val := entry.value
+
 	// Lazy Promotion: Only promote if >10s have passed since last promotion
 	// This avoids "thundering herd" on Write Lock for hot items
 	if time.Since(entry.lastPromoted) > 10*time.Second {
@@ -156,7 +159,7 @@ func (c *simpleLRUCache) Get(key string) (*Metadata, bool) {
 		c.mu.RUnlock()
 	}
 
-	return entry.value, true
+	return val, true
 }
 
 func (c *simpleLRUCache) Put(key string, value *Metadata, size int64) {

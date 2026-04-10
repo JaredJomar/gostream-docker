@@ -10,48 +10,47 @@ import (
 )
 
 // MigrateFromJSON reads legacy JSON state files and populates the SQLite database.
-// Migration is atomic per table: all inserts happen in a single transaction,
-// then JSON files are renamed to .migrated only after successful commit.
-// If the DB exists but .migrated files don't, the DB is considered incomplete
-// (previous crash) and is recreated from JSON.
+// Migration is granular per table: only tables whose JSON source file still exists
+// are cleared and re-migrated. Tables whose JSON is already .migrated are left intact.
+// This prevents a single recreated JSON file from wiping unrelated DB tables.
 func (d *DB) MigrateFromJSON(stateDir string) error {
 	inodePath := filepath.Join(stateDir, "inode_map.json")
 	negPath := filepath.Join(stateDir, "no_mkv_hashes.json")
 	fullPath := filepath.Join(stateDir, "tv_fullpacks.json")
 	epPath := filepath.Join(stateDir, "tv_episode_registry.json")
 
-	// Check if migration was already completed (all JSON files renamed)
-	allMigrated := true
-	for _, p := range []string{inodePath, negPath, fullPath, epPath} {
-		if _, err := os.Stat(p); err == nil {
-			allMigrated = false
-			break
-		}
-	}
-	if allMigrated {
+	needsInodes := fileExists(inodePath)
+	needsCaches := fileExists(negPath) || fileExists(fullPath)
+	needsEpisodes := fileExists(epPath)
+
+	if !needsInodes && !needsCaches && !needsEpisodes {
 		if d.logger != nil {
 			d.logger.Printf("[StateDB] Migration already completed (all JSON files renamed)")
 		}
 		return nil
 	}
 
-	// Check if DB has data but files aren't migrated -> crash recovery
-	hasData, err := d.hasAnyData()
-	if err != nil {
-		return fmt.Errorf("metadb: check data: %w", err)
-	}
-	if hasData {
-		if d.logger != nil {
-			d.logger.Printf("[StateDB] DB has data but JSON not migrated — crash recovery, recreating DB")
+	// Targeted cleanup: only clear the tables we are about to re-migrate.
+	// Other tables (already migrated) are left untouched.
+	if needsInodes {
+		if _, err := d.db.Exec("DELETE FROM inodes"); err != nil {
+			return fmt.Errorf("metadb: clear inodes: %w", err)
 		}
-		if err := d.recreateDB(); err != nil {
-			return fmt.Errorf("metadb: recreate: %w", err)
+	}
+	if needsCaches {
+		if _, err := d.db.Exec("DELETE FROM sync_caches"); err != nil {
+			return fmt.Errorf("metadb: clear sync_caches: %w", err)
+		}
+	}
+	if needsEpisodes {
+		if _, err := d.db.Exec("DELETE FROM tv_episodes"); err != nil {
+			return fmt.Errorf("metadb: clear tv_episodes: %w", err)
 		}
 	}
 
 	// Migrate inodes
 	var inodeCount int
-	if _, err := os.Stat(inodePath); err == nil {
+	if needsInodes {
 		n, err := d.migrateInodes(inodePath)
 		if err != nil {
 			return fmt.Errorf("metadb: migrate inodes: %w", err)
@@ -61,9 +60,7 @@ func (d *DB) MigrateFromJSON(stateDir string) error {
 
 	// Migrate sync caches
 	var cacheCount int
-	negExists := fileExists(negPath)
-	fullExists := fileExists(fullPath)
-	if negExists || fullExists {
+	if needsCaches {
 		n, err := d.migrateCaches(negPath, fullPath)
 		if err != nil {
 			return fmt.Errorf("metadb: migrate caches: %w", err)
@@ -73,7 +70,7 @@ func (d *DB) MigrateFromJSON(stateDir string) error {
 
 	// Migrate episodes
 	var epCount int
-	if _, err := os.Stat(epPath); err == nil {
+	if needsEpisodes {
 		n, err := d.migrateEpisodes(epPath)
 		if err != nil {
 			return fmt.Errorf("metadb: migrate episodes: %w", err)
@@ -81,7 +78,7 @@ func (d *DB) MigrateFromJSON(stateDir string) error {
 		epCount = n
 	}
 
-	// Only rename files after all migrations succeed
+	// Rename migrated JSON files
 	for _, p := range []string{inodePath, negPath, fullPath, epPath} {
 		if fileExists(p) {
 			if err := os.Rename(p, p+".migrated"); err != nil {
@@ -103,43 +100,6 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-func (d *DB) hasAnyData() (bool, error) {
-	var count int
-	err := d.db.QueryRow("SELECT COUNT(*) FROM inodes").Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	if count > 0 {
-		return true, nil
-	}
-	err = d.db.QueryRow("SELECT COUNT(*) FROM sync_caches").Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	if count > 0 {
-		return true, nil
-	}
-	err = d.db.QueryRow("SELECT COUNT(*) FROM tv_episodes").Scan(&count)
-	return count > 0, err
-}
-
-func (d *DB) recreateDB() error {
-	if err := d.db.Close(); err != nil {
-		return err
-	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		p := d.path + suffix
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	newDB, err := New(d.path, d.logger)
-	if err != nil {
-		return err
-	}
-	d.db = newDB.db
-	return nil
-}
 
 // migrateInodes reads inode_map.json and inserts all entries.
 // The actual JSON format is:

@@ -935,11 +935,22 @@ func (e *MovieGoEngine) pruneExpiredCaches() {
 }
 
 func (e *MovieGoEngine) saveAllCaches() {
-	e.saveCache(e.noMKVCFile, e.noMKVCache)
+	// no_mkv_hashes.json is managed by SQLite after migration — skip if .migrated exists
+	// to avoid triggering the DB crash-recovery wipe on next restart.
+	if !isMigratedFile(e.noMKVCFile) {
+		e.saveCache(e.noMKVCFile, e.noMKVCache)
+	}
 	e.saveCache(e.noStreamsCFile, e.noStreamsCache)
 	e.saveCache(e.recheckCFile, e.recheckCache)
 	e.saveCache(e.addFailCFile, e.addFailCache)
 	e.saveIMDBCache(e.imdbCFile, e.imdbCache)
+}
+
+// isMigratedFile returns true if path+".migrated" exists, indicating the file
+// has been ingested into SQLite and the raw JSON should no longer be written.
+func isMigratedFile(path string) bool {
+	_, err := os.Stat(path + ".migrated")
+	return err == nil
 }
 
 func (e *MovieGoEngine) saveCache(file string, data interface{}) {

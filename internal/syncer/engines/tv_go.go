@@ -109,11 +109,12 @@ var (
 	reTVExclLang  = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷|🇺🇦|🇵🇱|🇳🇱|🇹🇷|🇸🇦|🇮🇳|🇨🇿|🇭🇺|🇷🇴`)
 	reTVSeeders   = regexp.MustCompile(`👤\s*(\d+)`)
 	reTVSize      = regexp.MustCompile(`(?i)(\d+\.?\d*)\s*(GB|TB)`)
-	reTVFullpack  = regexp.MustCompile(`(?i)\b(season|complete|full|pack)\b`)
-	reTVRange     = regexp.MustCompile(`(?i)s\d+e\d+\s*-\s*e?\d+`)
-	reTVMultiEp   = regexp.MustCompile(`(?i)s\d+e\d+`)
-	reTVSeason    = regexp.MustCompile(`\.s\d{2}\.`)
-	reTVSeasonP   = regexp.MustCompile(`\ss\d{2}\s*\(`)
+	reTVFullpack     = regexp.MustCompile(`(?i)\b(season|complete|full|pack)\b`)
+	reTVRange        = regexp.MustCompile(`(?i)s\d+e\d+\s*-\s*e?\d+`)
+	reTVMultiEp      = regexp.MustCompile(`(?i)s\d+e\d+`)
+	reTVSeason       = regexp.MustCompile(`\.s\d{2}\.`)
+	reTVSeasonP      = regexp.MustCompile(`\ss\d{2}\s*\(`)
+	reTVSpecialTitle = regexp.MustCompile(`(?i)\b(special|christmas|bonus|extra|ova)\b`)
 	reTVSeasonN   = regexp.MustCompile(`[Ss](\d+)`)
 	reTVSeasonR   = regexp.MustCompile(`\bs(\d{1,2})\s*[-–]\s*s(\d{1,2})\b`)
 	reTVSeasonW   = regexp.MustCompile(`\bseasons?\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\b`)
@@ -235,7 +236,13 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 		e.processShow(ctx, show)
 	}
 
-	e.saveRegistry()
+	// Only write JSON registry when DB is unavailable. If DB is active,
+	// episodes were already persisted via registerEpisode() → UpsertEpisode().
+	// Writing JSON here would recreate tv_episode_registry.json after migration,
+	// causing the crash-recovery logic to wipe the entire DB on next restart.
+	if e.db == nil {
+		e.saveRegistry()
+	}
 	e.cleanupOrphanedFiles()
 	e.cleanupOrphanedTorrents(ctx)
 	e.rehydrateMissingTorrents(ctx)
@@ -539,7 +546,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 	}
 
 	sort.Slice(streams, func(i, j int) bool {
-		return streams[j].Priority > streams[i].Priority
+		return streams[i].Priority > streams[j].Priority
 	})
 
 	created := 0
@@ -831,10 +838,15 @@ func (e *TVGoEngine) isFullpack(title string) bool {
 		return true
 	}
 	if reTVSeason.MatchString(t) && !reTVMultiEp.MatchString(t) {
-		return true
+		// Exclude single specials: "Show.S02.Christmas.Special" → not a fullpack
+		if !reTVSpecialTitle.MatchString(t) {
+			return true
+		}
 	}
 	if reTVSeasonP.MatchString(t) && !reTVMultiEp.MatchString(t) {
-		return true
+		if !reTVSpecialTitle.MatchString(t) {
+			return true
+		}
 	}
 	return false
 }
