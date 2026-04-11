@@ -108,7 +108,6 @@ var (
 	reTVITA       = regexp.MustCompile(`(?i)ita|🇮🇹|multi|dual`)
 	reTVExclLang  = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷|🇺🇦|🇵🇱|🇳🇱|🇹🇷|🇸🇦|🇮🇳|🇨🇿|🇭🇺|🇷🇴`)
 	reTVSeeders   = regexp.MustCompile(`👤\s*(\d+)`)
-	reTVSize      = regexp.MustCompile(`(?i)(\d+\.?\d*)\s*(GB|TB)`)
 	reTVFullpack     = regexp.MustCompile(`(?i)\b(season|complete|full|pack)\b`)
 	reTVRange        = regexp.MustCompile(`(?i)s\d+e\d+\s*-\s*e?\d+`)
 	reTVMultiEp      = regexp.MustCompile(`(?i)s\d+e\d+`)
@@ -841,7 +840,7 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 		QualityScore:  qualityScore,
 		Season:        season,
 		Seeders:       seeders,
-		SizeGB:        e.extractSizeGB(title),
+		SizeGB:        s.SizeGB,
 		Priority:      qualityScore + priorityBonus,
 	}
 }
@@ -954,18 +953,6 @@ func (e *TVGoEngine) extractSeeders(title string) int {
 	if len(m) > 1 {
 		n, _ := strconv.Atoi(m[1])
 		return n
-	}
-	return 0
-}
-
-func (e *TVGoEngine) extractSizeGB(title string) float64 {
-	m := reTVSize.FindStringSubmatch(title)
-	if len(m) >= 3 {
-		v, _ := strconv.ParseFloat(m[1], 64)
-		if strings.EqualFold(m[2], "TB") {
-			return v * 1024
-		}
-		return v
 	}
 	return 0
 }

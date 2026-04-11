@@ -224,6 +224,7 @@ func (c *Client) mapToStremioFormat(results []ProwlarrResult) []Stream {
 			Name:     fmt.Sprintf("Torrentio\n%s", resTag),
 			Title:    formattedTitle,
 			InfoHash: res.InfoHash,
+			SizeGB:   sizeGB,
 			BehaviorHints: BehaviorHints{
 				BingeGroup: fmt.Sprintf("prowlarr-%s", resTag),
 			},

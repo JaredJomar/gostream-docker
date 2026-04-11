@@ -128,7 +128,6 @@ var (
 	reMExclLang  = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷`)
 	reMGarbage   = regexp.MustCompile(`(?i)camrip|hdcam|hdts|telesync|\bts\b|telecine|\btc\b|\bscr\b|screener|webscreener`)
 	reMSeeders   = regexp.MustCompile(`👤\s*(\d+)`)
-	reMSize      = regexp.MustCompile(`(?i)💾\s*([\d.]+)\s*(GB|MB)`)
 	reMHashURL   = regexp.MustCompile(`link=([a-f0-9]{40})`)
 	reMMKVHash8  = regexp.MustCompile(`_([a-f0-9]{8})\.mkv$`)
 	reMYear      = regexp.MustCompile(`[._]((?:19|20)\d{2})[._]`)
@@ -552,7 +551,7 @@ func (e *MovieGoEngine) classifyMovieStream(s prowlarr.Stream) *MovieStream {
 		return nil
 	}
 
-	sizeGB := e.extractMovieSizeGB(title)
+	sizeGB := s.SizeGB
 
 	// 4K: accept unknown size with penalty; 1080p: reject unknown
 	if is4K {
@@ -631,18 +630,6 @@ func (e *MovieGoEngine) extractMovieSeeders(title string) int {
 	if len(m) > 1 {
 		n, _ := strconv.Atoi(m[1])
 		return n
-	}
-	return 0
-}
-
-func (e *MovieGoEngine) extractMovieSizeGB(title string) float64 {
-	m := reMSize.FindStringSubmatch(title)
-	if len(m) >= 3 {
-		v, _ := strconv.ParseFloat(m[1], 64)
-		if strings.EqualFold(m[2], "GB") {
-			return v
-		}
-		return v / 1000.0
 	}
 	return 0
 }

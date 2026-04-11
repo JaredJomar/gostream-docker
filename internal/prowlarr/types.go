@@ -29,6 +29,7 @@ type Stream struct {
 	Name          string        `json:"name"`
 	Title         string        `json:"title"`
 	InfoHash      string        `json:"infoHash"`
+	SizeGB        float64       `json:"-"` // Raw size from Prowlarr API (not title parsing)
 	BehaviorHints BehaviorHints `json:"behaviorHints"`
 }
 
