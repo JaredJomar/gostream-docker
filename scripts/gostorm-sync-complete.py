@@ -81,6 +81,7 @@ class GoStormSync:
     """Port evoluto di gostorm-sync-complete.sh con miglioramenti prestazionali e di qualità"""
     
     def __init__(self):
+        self.request_only_mode = bool((os.getenv('GOSTREAM_REQUEST_MOVIE_TMDB_IDS') or '').strip())
         # === CONFIGURATION (read from config.json, with sensible defaults) ===
         self.TORRSERVER_URL = _cfg.get('gostorm_url', 'http://127.0.0.1:8090')
         self.MOUNT_DIR = _cfg.get('physical_source_path', '/mnt/torrserver')
@@ -244,15 +245,18 @@ class GoStormSync:
         self._movie_core_index = self._load_core_index(self.MOVIE_CORE_INDEX_FILE)
         self._tv_core_index = self._load_core_index(self.TV_CORE_INDEX_FILE)
         self._movie_details_cache = {}
-        # Rebuild se file mancante / vuoto
-        if not self._movie_core_index:
-            self._rebuild_movie_core_index()
-        if not self._tv_core_index:
-            self._rebuild_tv_core_index()
+        # Rebuild se file mancante / vuoto (skip in request-only mode to avoid full scans)
+        if not self.request_only_mode:
+            if not self._movie_core_index:
+                self._rebuild_movie_core_index()
+            if not self._tv_core_index:
+                self._rebuild_tv_core_index()
 
-        # Populate TV library cache from existing shows on startup
-        if self.TV_PRESERVE_LIBRARY:
-            self._populate_tv_library_cache_from_existing()
+            # Populate TV library cache from existing shows on startup
+            if self.TV_PRESERVE_LIBRARY:
+                self._populate_tv_library_cache_from_existing()
+        else:
+            self.log("INFO", "Request-only mode: skipping startup full index/library scans")
 
     # === Logging utilities ===
     def setup_logging(self):
@@ -3513,6 +3517,7 @@ class GoStormSync:
         self.log("INFO", "=== PROCESSING MOVIES ===")
         
         request_ids_env = (os.getenv('GOSTREAM_REQUEST_MOVIE_TMDB_IDS') or '').strip()
+        request_only_mode = bool(request_ids_env)
         if request_ids_env:
             raw_ids = [x.strip() for x in request_ids_env.split(',') if x.strip()]
             ids: List[int] = []
@@ -3604,17 +3609,20 @@ class GoStormSync:
                 continue
 
             # Skip noisy retries for titles that recently had no Torrentio streams
-            if self._is_movie_no_stream_cached(imdb_id):
+            if (not request_only_mode) and self._is_movie_no_stream_cached(imdb_id):
                 self.log("INFO", f"Skip movie (recent no-stream cache): {title} ({imdb_id})")
                 continue
             # Skip movies recently checked and already considered stable
-            if self._is_movie_recheck_cached(imdb_id):
+            if (not request_only_mode) and self._is_movie_recheck_cached(imdb_id):
                 self.log("INFO", f"Skip movie (recheck cache): {title} ({imdb_id})")
                 continue
             # Skip movies in cooldown after repeated add-torrent failures
-            if self._is_movie_add_fail_cached(imdb_id):
+            if (not request_only_mode) and self._is_movie_add_fail_cached(imdb_id):
                 self.log("INFO", f"Skip movie (add-fail cooldown): {title} ({imdb_id})")
                 continue
+
+            if request_only_mode:
+                self.log("DEBUG", f"Request-only mode: bypassing cooldown caches for {title} ({imdb_id})")
             
             self.log("INFO", f"Processing movie: {title} ({imdb_id})")
             

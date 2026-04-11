@@ -1279,7 +1279,7 @@ class GoStormTV:
         # Skip if complete and quality is good enough
         return avg_score >= self.MIN_QUALITY_SKIP
 
-    def process_show(self, show: Dict) -> int:
+    def process_show(self, show: Dict, force_reprocess: bool = False) -> int:
         """
         Process a TV show - get streams, sort, and create episodes
         Skips seasons that are already complete with good quality.
@@ -1307,15 +1307,18 @@ class GoStormTV:
         self.log("INFO", f"Processing: {show_name} ({imdb_id})")
 
         # Check which seasons are already complete with good quality
-        complete_seasons = self._get_complete_seasons(show_name, tmdb_id)
         skipped_seasons = set()
-        for season_num, (ep_count, avg_score) in complete_seasons.items():
-            if avg_score >= self.MIN_QUALITY_SKIP:
-                skipped_seasons.add(season_num)
-                self.log("DEBUG", f"Skip S{season_num:02d}: {ep_count} eps, avg score {avg_score:.0f} >= {self.MIN_QUALITY_SKIP}")
+        if not force_reprocess:
+            complete_seasons = self._get_complete_seasons(show_name, tmdb_id)
+            for season_num, (ep_count, avg_score) in complete_seasons.items():
+                if avg_score >= self.MIN_QUALITY_SKIP:
+                    skipped_seasons.add(season_num)
+                    self.log("DEBUG", f"Skip S{season_num:02d}: {ep_count} eps, avg score {avg_score:.0f} >= {self.MIN_QUALITY_SKIP}")
 
-        if skipped_seasons:
-            self.log("INFO", f"Skipping seasons {sorted(skipped_seasons)} (complete, quality >= {self.MIN_QUALITY_SKIP})")
+            if skipped_seasons:
+                self.log("INFO", f"Skipping seasons {sorted(skipped_seasons)} (complete, quality >= {self.MIN_QUALITY_SKIP})")
+        else:
+            self.log("DEBUG", f"Request-only mode: bypassing complete-season skip for {show_name}")
 
         # Get and sort streams (pass tmdb_id to get correct number of seasons)
         streams = self.get_streams(imdb_id, tmdb_id, show_name=show_name)
@@ -1624,10 +1627,14 @@ class GoStormTV:
         self.log("INFO", "=" * 60)
 
         try:
-            # Protect existing files from cleanup (for shows now filtered by age/genre)
-            self._populate_registry_from_existing()
-
             request_ids_env = (os.getenv('GOSTREAM_REQUEST_TV_TMDB_IDS') or '').strip()
+            request_only_mode = bool(request_ids_env)
+            if not request_only_mode:
+                # Protect existing files from cleanup (for shows now filtered by age/genre)
+                self._populate_registry_from_existing()
+            else:
+                self.log("INFO", "Request-only mode: skipping full registry population scan")
+
             if request_ids_env:
                 raw_ids = [x.strip() for x in request_ids_env.split(',') if x.strip()]
                 ids: List[int] = []
@@ -1677,20 +1684,23 @@ class GoStormTV:
 
                 name = show.get('name') or show.get('original_name', '')
                 self.log("INFO", f"[{i}/{len(shows)}] {name}")
-                self.process_show(show)
+                self.process_show(show, force_reprocess=request_only_mode)
 
             # Save registry
             self._save_registry()
             self.log("INFO", "Registry saved")
 
-            # Cleanup
-            self.log("INFO", "Running cleanup...")
-            self.cleanup_orphaned_files()
-            self.cleanup_orphaned_torrents()
+            if not request_only_mode:
+                # Cleanup
+                self.log("INFO", "Running cleanup...")
+                self.cleanup_orphaned_files()
+                self.cleanup_orphaned_torrents()
 
-            # Rehydrate missing torrents (re-add from saved magnets)
-            self.log("INFO", "Checking for torrents to rehydrate...")
-            self.rehydrate_missing_torrents()
+                # Rehydrate missing torrents (re-add from saved magnets)
+                self.log("INFO", "Checking for torrents to rehydrate...")
+                self.rehydrate_missing_torrents()
+            else:
+                self.log("INFO", "Request-only mode: skipping cleanup and rehydrate scans")
 
             # Stats
             elapsed = time.time() - start_time
