@@ -152,9 +152,12 @@ func SetDefaultConfig() {
 	sets.PreloadCache = 0
 	sets.ConnectionsLimit = 25
 	sets.RetrackersMode = 1
-	sets.TorrentDisconnectTimeout = 30
+	sets.TorrentDisconnectTimeout = 15
 	sets.ReaderReadAHead = 75 // 75%
+	sets.EnableIPv6 = true
 	sets.ResponsiveMode = true
+	sets.AdaptiveShield = true
+	sets.DisableUTP = true
 	sets.ShowFSActiveTorr = true
 	sets.StoreSettingsInJson = true
 	BTsets = sets
@@ -204,9 +207,12 @@ func loadBTSets() {
 	sets.PreloadCache = 0
 	sets.ConnectionsLimit = 25
 	sets.RetrackersMode = 1
-	sets.TorrentDisconnectTimeout = 30
+	sets.TorrentDisconnectTimeout = 15
 	sets.ReaderReadAHead = 75 // 75%
+	sets.EnableIPv6 = true
 	sets.ResponsiveMode = true
+	sets.AdaptiveShield = true
+	sets.DisableUTP = true
 	sets.ShowFSActiveTorr = true
 	sets.StoreSettingsInJson = true
 	BTsets = sets

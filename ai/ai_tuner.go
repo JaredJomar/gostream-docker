@@ -57,7 +57,8 @@ type AIProvider struct {
 	APIKey       string     // API key for cloud providers (empty for local)
 	Model        string     // Model ID for cloud providers (empty for local)
 	IsLocal      bool       // true = llama.cpp, false = cloud API
-	GetBufferPct func() int // Returns FUSE buffer fill percentage (0-100)
+	GetBufferPct  func() int // Returns FUSE buffer fill percentage (0-100)
+	GetSaturation func() int // Returns number of active semaphore slots (concurrent FUSE readers)
 }
 
 // Keep-Alive client for llama.cpp local
@@ -342,6 +343,25 @@ func runTuningCycle(provider AIProvider) {
 		return
 	}
 	cycleCounter = 0
+
+	// Saturation guard: Plex scan attivo sullo stesso pack → sospendi LLM e resetta a default.
+	if provider.GetSaturation != nil && provider.GetSaturation() > 1 {
+		log.Printf("[AI-Pilot] Multi-reader detected (saturation>1). Suspending LLM call — resetting to defaults (%d conns, %ds timeout).", defaultConns, defaultTimeout)
+		for _, t := range activeTorrents {
+			if t.Torrent != nil {
+				t.Torrent.SetMaxEstablishedConns(defaultConns)
+				t.AddExpiredTime(time.Duration(defaultTimeout) * time.Second)
+			}
+		}
+		atomic.StoreInt32(&CurrentLimit, int32(defaultConns))
+		lastConns = defaultConns
+		lastTimeout = defaultTimeout
+		metricsHistory = nil
+		torrentSpeedAvg = nil
+		cpuUsageAvg = nil
+		peakCPUCycle = 0
+		return
+	}
 
 	// Post-reset guard: skip AI call if we're still in the cooldown after context change
 	if skipAICycles > 0 {

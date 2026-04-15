@@ -108,12 +108,12 @@ var (
 	reTVITA       = regexp.MustCompile(`(?i)ita|🇮🇹|multi|dual`)
 	reTVExclLang  = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷|🇺🇦|🇵🇱|🇳🇱|🇹🇷|🇸🇦|🇮🇳|🇨🇿|🇭🇺|🇷🇴`)
 	reTVSeeders   = regexp.MustCompile(`👤\s*(\d+)`)
-	reTVSize      = regexp.MustCompile(`(?i)(\d+\.?\d*)\s*(GB|TB)`)
-	reTVFullpack  = regexp.MustCompile(`(?i)\b(season|complete|full|pack)\b`)
-	reTVRange     = regexp.MustCompile(`(?i)s\d+e\d+\s*-\s*e?\d+`)
-	reTVMultiEp   = regexp.MustCompile(`(?i)s\d+e\d+`)
-	reTVSeason    = regexp.MustCompile(`\.s\d{2}\.`)
-	reTVSeasonP   = regexp.MustCompile(`\ss\d{2}\s*\(`)
+	reTVFullpack     = regexp.MustCompile(`(?i)\b(season|complete|full|pack)\b`)
+	reTVRange        = regexp.MustCompile(`(?i)s\d+e\d+\s*-\s*e?\d+`)
+	reTVMultiEp      = regexp.MustCompile(`(?i)s\d+e\d+`)
+	reTVSeason       = regexp.MustCompile(`\.s\d{2}\.`)
+	reTVSeasonP      = regexp.MustCompile(`\ss\d{2}\s*\(`)
+	reTVSpecialTitle = regexp.MustCompile(`(?i)\b(special|christmas|bonus|extra|ova)\b`)
 	reTVSeasonN   = regexp.MustCompile(`[Ss](\d+)`)
 	reTVSeasonR   = regexp.MustCompile(`\bs(\d{1,2})\s*[-–]\s*s(\d{1,2})\b`)
 	reTVSeasonW   = regexp.MustCompile(`\bseasons?\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\b`)
@@ -211,6 +211,7 @@ func (e *TVGoEngine) Name() string { return "tv" }
 func (e *TVGoEngine) Run(ctx context.Context) error {
 	e.logger.Printf("Starting TV sync...")
 	e.populateRegistryFromExisting()
+	e.reconcileRegistry()
 
 	shows, err := e.discoverShows(ctx)
 	if err != nil {
@@ -235,7 +236,13 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 		e.processShow(ctx, show)
 	}
 
-	e.saveRegistry()
+	// Only write JSON registry when DB is unavailable. If DB is active,
+	// episodes were already persisted via registerEpisode() → UpsertEpisode().
+	// Writing JSON here would recreate tv_episode_registry.json after migration,
+	// causing the crash-recovery logic to wipe the entire DB on next restart.
+	if e.db == nil {
+		e.saveRegistry()
+	}
 	e.cleanupOrphanedFiles()
 	e.cleanupOrphanedTorrents(ctx)
 	e.rehydrateMissingTorrents(ctx)
@@ -464,6 +471,29 @@ func (e *TVGoEngine) discoverShows(ctx context.Context) ([]tmdb.TVShow, error) {
 	return all, nil
 }
 
+// isShowRecent returns true if the show has had recent activity within tvMaxShowAgeDays.
+// Mirrors Python's _is_show_recent(): checks first_air_date, last_air_date, and
+// next_episode_to_air so that old shows with new seasons (e.g. Stranger Things S5)
+// are not incorrectly filtered out.
+func isShowRecent(details *tmdb.TVDetail) bool {
+	cutoff := time.Now().AddDate(0, 0, -tvMaxShowAgeDays)
+	parse := func(s string) (time.Time, bool) {
+		t, err := time.Parse("2006-01-02", s)
+		return t, err == nil && !t.IsZero()
+	}
+
+	if t, ok := parse(details.FirstAirDate); ok && t.After(cutoff) {
+		return true
+	}
+	if t, ok := parse(details.LastAirDate); ok && t.After(cutoff) {
+		return true
+	}
+	if details.NextEpisodeToAir != nil {
+		return true
+	}
+	return false
+}
+
 func (e *TVGoEngine) passesShowFilters(show tmdb.TVShow) bool {
 	// Genre filter
 	for _, gid := range show.GenreIDs {
@@ -512,6 +542,17 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 	}
 	e.logger.Printf("  TMDB lookups: %v", time.Since(t0).Round(time.Millisecond))
 
+	// Age check: skip shows with no recent activity (mirrors Python _is_show_recent).
+	// TVOnTheAir/AiringToday endpoints guarantee recency, but TVTrending and Discover
+	// can surface old shows. We check all three conditions on TVDetail fields:
+	//   1. premiered recently (first_air_date)
+	//   2. aired recently — catches old shows with new seasons (last_air_date)
+	//   3. has upcoming episodes planned (next_episode_to_air)
+	if !isShowRecent(details) {
+		e.logger.Printf("  Skipping '%s' — no recent activity (last: %s, next: %v)", showName, details.LastAirDate, details.NextEpisodeToAir != nil)
+		return
+	}
+
 	// Check complete seasons
 	completeSeasons := e.getCompleteSeasons(showName, details)
 	skippedSeasons := make(map[int]bool)
@@ -539,7 +580,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 	}
 
 	sort.Slice(streams, func(i, j int) bool {
-		return streams[j].Priority > streams[i].Priority
+		return streams[i].Priority > streams[j].Priority
 	})
 
 	created := 0
@@ -571,6 +612,14 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 		}
 		if seasonsComplete[stream.Season] {
 			continue
+		}
+		// Pre-check: if season is already complete in registry at equal/lower quality, skip
+		// without fetching torrent info (AddTorrent + GetTorrentInfo can take up to 90s).
+		if avgScore, isComplete := completeSeasons[stream.Season]; isComplete {
+			if float64(stream.QualityScore) <= avgScore*tvUpgradeThreshold {
+				e.logger.Printf("    fullpack S%02d: already complete (registry avg=%.0f, stream=%d) — skipped", stream.Season, avgScore, stream.QualityScore)
+				continue
+			}
 		}
 
 		t2 := time.Now()
@@ -656,9 +705,25 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 			}
 		}
 		e.logger.Printf("    Prowlarr: %d streams in %v", len(allStreams), time.Since(tp).Round(time.Millisecond))
+
+		// If Prowlarr returned streams but none survive classification, discard and try Torrentio.
+		if len(allStreams) > 0 {
+			anyUsable := false
+			for _, s := range allStreams {
+				if e.classifyStream(s) != nil {
+					anyUsable = true
+					break
+				}
+			}
+			if !anyUsable {
+				e.logger.Printf("    Prowlarr: all %d streams discarded — trying Torrentio", len(allStreams))
+				allStreams = allStreams[:0]
+				clear(seenHashes)
+			}
+		}
 	}
 
-	// Torrentio fallback
+	// Torrentio fallback: Prowlarr down, timeout, 0 results, or all discarded
 	if len(allStreams) == 0 {
 		seasonEps := make(map[int]int)
 		for _, sd := range details.Seasons {
@@ -775,7 +840,7 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 		QualityScore:  qualityScore,
 		Season:        season,
 		Seeders:       seeders,
-		SizeGB:        e.extractSizeGB(title),
+		SizeGB:        s.SizeGB,
 		Priority:      qualityScore + priorityBonus,
 	}
 }
@@ -831,10 +896,15 @@ func (e *TVGoEngine) isFullpack(title string) bool {
 		return true
 	}
 	if reTVSeason.MatchString(t) && !reTVMultiEp.MatchString(t) {
-		return true
+		// Exclude single specials: "Show.S02.Christmas.Special" → not a fullpack
+		if !reTVSpecialTitle.MatchString(t) {
+			return true
+		}
 	}
 	if reTVSeasonP.MatchString(t) && !reTVMultiEp.MatchString(t) {
-		return true
+		if !reTVSpecialTitle.MatchString(t) {
+			return true
+		}
 	}
 	return false
 }
@@ -887,18 +957,6 @@ func (e *TVGoEngine) extractSeeders(title string) int {
 	return 0
 }
 
-func (e *TVGoEngine) extractSizeGB(title string) float64 {
-	m := reTVSize.FindStringSubmatch(title)
-	if len(m) >= 3 {
-		v, _ := strconv.ParseFloat(m[1], 64)
-		if strings.EqualFold(m[2], "TB") {
-			return v * 1024
-		}
-		return v
-	}
-	return 0
-}
-
 func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, stream TVStream, firstAirDate string) int {
 	magnet := BuildMagnet(stream.Hash, stream.Title, DefaultTrackers())
 	hash, err := e.gostorm.AddTorrent(ctx, magnet, stream.Title)
@@ -927,6 +985,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 	}
 
 	created := 0
+	skipped := 0
 	cleanShow := e.getShowFolderName(showName, firstAirDate)
 
 	for _, vf := range videoFiles {
@@ -946,12 +1005,9 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 		if existing, ok := e.registry[key]; ok {
 			if float64(stream.QualityScore) <= float64(existing.QualityScore)*tvUpgradeThreshold {
 				e.stats.EpisodesSkipped++
+				skipped++
 				e.processedThisRun[key] = true
 				continue
-			}
-			if existing.FilePath != "" {
-				os.Remove(existing.FilePath)
-				e.stats.Upgrades++
 			}
 		}
 
@@ -961,6 +1017,10 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, vf.ID)
 
 		if e.createMKV(epPath, streamURL, vf.Length, magnet) {
+			if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
+				os.Remove(existing.FilePath)
+				e.stats.Upgrades++
+			}
 			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack")
 			e.processedThisRun[key] = true
 			created++
@@ -968,6 +1028,9 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 		}
 	}
 
+	if skipped > 0 && created == 0 {
+		e.logger.Printf("  fullpack skipped: %d/%d eps already at sufficient quality (score %d)", skipped, len(videoFiles), stream.QualityScore)
+	}
 	if created == 0 {
 		e.gostorm.RemoveTorrent(ctx, hash)
 	}
@@ -994,6 +1057,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 		if float64(stream.QualityScore) <= float64(existing.QualityScore)*tvUpgradeThreshold {
 			e.stats.EpisodesSkipped++
 			e.processedThisRun[key] = true
+			e.logger.Printf("  Skip S%02dE%02d: score %d <= existing %d (threshold %.0f)", season, episode, stream.QualityScore, existing.QualityScore, float64(existing.QualityScore)*tvUpgradeThreshold)
 			return 0
 		}
 	}
@@ -1025,12 +1089,6 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 		return 0
 	}
 
-	// Remove old file AFTER confirming new torrent is valid
-	if existing, ok := e.registry[key]; ok && existing.FilePath != "" {
-		os.Remove(existing.FilePath)
-		e.stats.Upgrades++
-	}
-
 	cleanShow := e.getShowFolderName(showName, firstAirDate)
 	seasonDir := filepath.Join(e.tvDir, cleanShow, fmt.Sprintf("Season.%02d", season))
 	epFilename := e.buildFilename(showName, season, episode, hash[:8])
@@ -1038,6 +1096,10 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
 	if e.createMKV(epPath, streamURL, bestFile.Length, magnet) {
+		if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
+			os.Remove(existing.FilePath)
+			e.stats.Upgrades++
+		}
 		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single")
 		e.processedThisRun[key] = true
 		e.logger.Printf("Created: %s", epFilename)
@@ -1077,6 +1139,28 @@ func (e *TVGoEngine) getCompleteSeasons(showName string, details *tmdb.TVDetail)
 	return complete
 }
 
+// reconcileRegistry removes registry entries whose backing MKV file no longer
+// exists on disk (ghost entries). It runs before the main show-processing loop
+// so that the current sync can immediately search for and recreate missing episodes.
+func (e *TVGoEngine) reconcileRegistry() {
+	removed := 0
+	for key, entry := range e.registry {
+		if _, err := os.Stat(entry.FilePath); os.IsNotExist(err) {
+			delete(e.registry, key)
+			if e.db != nil {
+				if err := e.db.DeleteEpisode(key); err != nil {
+					e.logger.Printf("[TVSync] Warning: failed to delete ghost entry %s from DB: %v", key, err)
+				}
+			}
+			removed++
+			e.logger.Printf("[TVSync] Ghost entry removed: %s (missing: %s)", key, entry.FilePath)
+		}
+	}
+	if removed > 0 {
+		e.logger.Printf("[TVSync] Reconciliation complete: %d ghost entries removed", removed)
+	}
+}
+
 func (e *TVGoEngine) cleanupOrphanedFiles() {
 	if _, err := os.Stat(e.tvDir); err != nil {
 		return
@@ -1096,6 +1180,21 @@ func (e *TVGoEngine) cleanupOrphanedFiles() {
 		}
 		return nil
 	})
+
+	// Remove empty season and show directories (deepest first)
+	var dirs []string
+	filepath.Walk(e.tvDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.IsDir() && path != e.tvDir {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	for i := len(dirs) - 1; i >= 0; i-- {
+		entries, _ := os.ReadDir(dirs[i])
+		if len(entries) == 0 {
+			os.Remove(dirs[i])
+		}
+	}
 }
 
 func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {

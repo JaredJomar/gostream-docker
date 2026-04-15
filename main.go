@@ -2856,6 +2856,9 @@ func main() {
 				}
 				return pct
 			},
+			GetSaturation: func() int {
+				return len(masterDataSemaphore)
+			},
 		}
 		go ai.StartAITuner(context.Background(), provider)
 	}

@@ -128,7 +128,6 @@ var (
 	reMExclLang  = regexp.MustCompile(`🇪🇸|🇫🇷|🇩🇪|🇷🇺|🇨🇳|🇯🇵|🇰🇷|🇹🇭|🇵🇹|🇧🇷`)
 	reMGarbage   = regexp.MustCompile(`(?i)camrip|hdcam|hdts|telesync|\bts\b|telecine|\btc\b|\bscr\b|screener|webscreener`)
 	reMSeeders   = regexp.MustCompile(`👤\s*(\d+)`)
-	reMSize      = regexp.MustCompile(`(?i)💾\s*([\d.]+)\s*(GB|MB)`)
 	reMHashURL   = regexp.MustCompile(`link=([a-f0-9]{40})`)
 	reMMKVHash8  = regexp.MustCompile(`_([a-f0-9]{8})\.mkv$`)
 	reMYear      = regexp.MustCompile(`[._]((?:19|20)\d{2})[._]`)
@@ -468,7 +467,7 @@ func (e *MovieGoEngine) getMovieStreams(ctx context.Context, imdbID, title strin
 	// Prowlarr first
 	if e.prowlarr != nil {
 		streams := e.prowlarr.FetchTorrents(imdbID, "movie", title)
-		if len(streams) > 0 {
+		if len(e.filterMovieStreams(streams)) > 0 {
 			return streams, nil
 		}
 	}
@@ -541,7 +540,7 @@ func (e *MovieGoEngine) classifyMovieStream(s prowlarr.Stream) *MovieStream {
 	}
 
 	seeders := e.extractMovieSeeders(title)
-	if seeders < mMovieMinSeeders {
+	if seeders > 0 && seeders < mMovieMinSeeders {
 		return nil
 	}
 
@@ -552,7 +551,7 @@ func (e *MovieGoEngine) classifyMovieStream(s prowlarr.Stream) *MovieStream {
 		return nil
 	}
 
-	sizeGB := e.extractMovieSizeGB(title)
+	sizeGB := s.SizeGB
 
 	// 4K: accept unknown size with penalty; 1080p: reject unknown
 	if is4K {
@@ -631,18 +630,6 @@ func (e *MovieGoEngine) extractMovieSeeders(title string) int {
 	if len(m) > 1 {
 		n, _ := strconv.Atoi(m[1])
 		return n
-	}
-	return 0
-}
-
-func (e *MovieGoEngine) extractMovieSizeGB(title string) float64 {
-	m := reMSize.FindStringSubmatch(title)
-	if len(m) >= 3 {
-		v, _ := strconv.ParseFloat(m[1], 64)
-		if strings.EqualFold(m[2], "GB") {
-			return v
-		}
-		return v / 1000.0
 	}
 	return 0
 }
@@ -935,11 +922,22 @@ func (e *MovieGoEngine) pruneExpiredCaches() {
 }
 
 func (e *MovieGoEngine) saveAllCaches() {
-	e.saveCache(e.noMKVCFile, e.noMKVCache)
+	// no_mkv_hashes.json is managed by SQLite after migration — skip if .migrated exists
+	// to avoid triggering the DB crash-recovery wipe on next restart.
+	if !isMigratedFile(e.noMKVCFile) {
+		e.saveCache(e.noMKVCFile, e.noMKVCache)
+	}
 	e.saveCache(e.noStreamsCFile, e.noStreamsCache)
 	e.saveCache(e.recheckCFile, e.recheckCache)
 	e.saveCache(e.addFailCFile, e.addFailCache)
 	e.saveIMDBCache(e.imdbCFile, e.imdbCache)
+}
+
+// isMigratedFile returns true if path+".migrated" exists, indicating the file
+// has been ingested into SQLite and the raw JSON should no longer be written.
+func isMigratedFile(path string) bool {
+	_, err := os.Stat(path + ".migrated")
+	return err == nil
 }
 
 func (e *MovieGoEngine) saveCache(file string, data interface{}) {

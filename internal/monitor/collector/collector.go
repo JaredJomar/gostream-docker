@@ -580,13 +580,17 @@ func (c *Collector) enrichTorrents(torrents []TorrentInfo) {
 			t.Channels = "2.0"
 		}
 
-		// Try Plex session match (by hash8 in filename — LAST 8 chars of InfoHash,
-		// matching the naming convention in buildMovieFilename: hash[len-8:])
-		hash8 := t.Hash
-		if len(hash8) >= 8 {
-			hash8 = hash8[len(hash8)-8:]
+		// Try Plex session match: movie filenames use hash[len-8:], TV filenames use hash[:8].
+		// Try both to cover all cases.
+		var sess plexSession
+		var ok bool
+		if len(t.Hash) >= 8 {
+			sess, ok = sessions[t.Hash[len(t.Hash)-8:]]
+			if !ok {
+				sess, ok = sessions[t.Hash[:8]]
+			}
 		}
-		if sess, ok := sessions[hash8]; ok {
+		if ok {
 			t.CleanTitle = sess.Title
 			t.Year = sess.Year
 			t.Poster = sess.Poster
