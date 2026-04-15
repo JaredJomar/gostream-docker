@@ -30,6 +30,7 @@ FROM lscr.io/linuxserver/plex:latest
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+  bash \
       ca-certificates \
       curl \
       fuse3 \
@@ -43,4 +44,5 @@ COPY --from=build /out/gostream /usr/local/bin/gostream
 # Windows bind mounts can drop execute bits, so bake the custom hook scripts in.
 COPY ./custom-services /custom-services.d
 COPY ./custom-cont-init /custom-cont-init.d
-RUN chmod +x /custom-services.d/* /custom-cont-init.d/* || true
+RUN sed -i 's/\r$//' /custom-services.d/* /custom-cont-init.d/* /app/scripts/* || true \
+    && chmod +x /custom-services.d/* /custom-cont-init.d/* || true

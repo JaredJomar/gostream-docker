@@ -63,8 +63,6 @@ services:
       - "${BASE_DIR}/${CONTAINER_NAME}/transcode:/transcode"
 
       # GoStream config.json (BAT writes/patches this into the real-source tree)
-      - "${BASE_DIR}/gostream-mkv-real/config/config.json:/config.json:ro"
+      - "${BASE_DIR}/gostream-mkv-real/config/config.json:/config.json"
 
-      # s6-overlay hooks (mounted read-only; deterministic custom startup)
-      - "${STACK_DIR}/custom-services:/custom-services.d:ro"
-      - "${STACK_DIR}/custom-cont-init:/custom-cont-init.d:ro"
+      # s6-overlay hooks are baked into the image via Dockerfile.

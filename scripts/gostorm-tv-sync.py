@@ -82,7 +82,17 @@ def _signal_handler(signum, frame):
 signal.signal(signal.SIGTERM, _signal_handler)
 signal.signal(signal.SIGINT, _signal_handler)
 from urllib.parse import quote
-from prowlarr_client import ProwlarrClient
+
+_ProwlarrClient: Any
+try:
+    from prowlarr_client import ProwlarrClient as _ProwlarrClient
+except ImportError:
+    _ProwlarrClient = None
+
+
+class _NullProwlarrClient:
+    def fetch_torrents(self, *args, **kwargs):
+        return []
 
 
 class EpisodeInfo(NamedTuple):
@@ -143,7 +153,10 @@ class GoStormTV:
         self._trackers_cache_time = 0
         
         # Prowlarr Adapter
-        self.prowlarr = ProwlarrClient()
+        if _ProwlarrClient is not None:
+            self.prowlarr = _ProwlarrClient()
+        else:
+            self.prowlarr = _NullProwlarrClient()
 
         # Ensure directories exist
         for d in [self.STATE_DIR, self.TV_DIR, os.path.dirname(self.LOG_FILE)]:
@@ -240,6 +253,9 @@ class GoStormTV:
     def _save_registry(self):
         """Save episode registry atomically with file lock to prevent corruption"""
         import fcntl
+        flock = getattr(fcntl, 'flock', None)
+        lock_ex = getattr(fcntl, 'LOCK_EX', None)
+        lock_un = getattr(fcntl, 'LOCK_UN', None)
         lock_file = self.REGISTRY_FILE + '.lock'
         # Use PID in temp filename to avoid race conditions between processes
         tmp = f"{self.REGISTRY_FILE}.{os.getpid()}.tmp"
@@ -250,7 +266,8 @@ class GoStormTV:
 
             # Acquire lock FIRST to prevent concurrent writes
             with open(lock_file, 'w') as lf:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                if flock is not None and lock_ex is not None:
+                    flock(lf.fileno(), lock_ex)
                 try:
                     # Write to temp file while holding lock
                     with open(tmp, 'w') as f:
@@ -261,7 +278,8 @@ class GoStormTV:
                     # Atomic replace
                     os.replace(tmp, self.REGISTRY_FILE)
                 finally:
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                    if flock is not None and lock_un is not None:
+                        flock(lf.fileno(), lock_un)
                     # Cleanup temp file if it still exists
                     if os.path.exists(tmp):
                         try:
@@ -368,7 +386,7 @@ class GoStormTV:
             time.sleep(self.API_DELAY - elapsed)
         self._last_api_call = time.time()
 
-    def _get(self, url: str, params: Dict = None, timeout: int = 30) -> Optional[requests.Response]:
+    def _get(self, url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Optional[requests.Response]:
         """GET request with rate limiting and retries"""
         self._rate_limit()
         for attempt in range(3):
@@ -382,7 +400,7 @@ class GoStormTV:
             time.sleep(2 ** attempt)
         return None
 
-    def _post(self, url: str, data: Dict, timeout: int = 30) -> Optional[requests.Response]:
+    def _post(self, url: str, data: Dict[str, Any], timeout: int = 30) -> Optional[requests.Response]:
         """POST request with rate limiting"""
         self._rate_limit()
         try:
@@ -432,7 +450,7 @@ class GoStormTV:
         magnet = f"magnet:?xt=urn:btih:{info_hash}"
         if name:
             magnet += f"&dn={quote(name)}"
-        trackers = self._setup_trackers_cache() if hasattr(self, '_setup_trackers_cache') else self._fetch_trackers()
+        trackers = self._fetch_trackers()
         for tr in trackers:
             magnet += f"&tr={quote(tr)}"
         return magnet
@@ -651,7 +669,7 @@ class GoStormTV:
 
     # ===== TMDB DISCOVERY =====
 
-    def _tmdb_get(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
+    def _tmdb_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """TMDB API request"""
         url = f"{self.TMDB_BASE_URL}/{endpoint}"
         params = params or {}
@@ -1261,7 +1279,7 @@ class GoStormTV:
         # Skip if complete and quality is good enough
         return avg_score >= self.MIN_QUALITY_SKIP
 
-    def process_show(self, show: Dict) -> int:
+    def process_show(self, show: Dict, force_reprocess: bool = False) -> int:
         """
         Process a TV show - get streams, sort, and create episodes
         Skips seasons that are already complete with good quality.
@@ -1289,15 +1307,18 @@ class GoStormTV:
         self.log("INFO", f"Processing: {show_name} ({imdb_id})")
 
         # Check which seasons are already complete with good quality
-        complete_seasons = self._get_complete_seasons(show_name, tmdb_id)
         skipped_seasons = set()
-        for season_num, (ep_count, avg_score) in complete_seasons.items():
-            if avg_score >= self.MIN_QUALITY_SKIP:
-                skipped_seasons.add(season_num)
-                self.log("DEBUG", f"Skip S{season_num:02d}: {ep_count} eps, avg score {avg_score:.0f} >= {self.MIN_QUALITY_SKIP}")
+        if not force_reprocess:
+            complete_seasons = self._get_complete_seasons(show_name, tmdb_id)
+            for season_num, (ep_count, avg_score) in complete_seasons.items():
+                if avg_score >= self.MIN_QUALITY_SKIP:
+                    skipped_seasons.add(season_num)
+                    self.log("DEBUG", f"Skip S{season_num:02d}: {ep_count} eps, avg score {avg_score:.0f} >= {self.MIN_QUALITY_SKIP}")
 
-        if skipped_seasons:
-            self.log("INFO", f"Skipping seasons {sorted(skipped_seasons)} (complete, quality >= {self.MIN_QUALITY_SKIP})")
+            if skipped_seasons:
+                self.log("INFO", f"Skipping seasons {sorted(skipped_seasons)} (complete, quality >= {self.MIN_QUALITY_SKIP})")
+        else:
+            self.log("DEBUG", f"Request-only mode: bypassing complete-season skip for {show_name}")
 
         # Get and sort streams (pass tmdb_id to get correct number of seasons)
         streams = self.get_streams(imdb_id, tmdb_id, show_name=show_name)
@@ -1520,6 +1541,14 @@ class GoStormTV:
         import fcntl
         import atexit
 
+        flock = getattr(fcntl, 'flock', None)
+        lock_ex = getattr(fcntl, 'LOCK_EX', None)
+        lock_nb = getattr(fcntl, 'LOCK_NB', None)
+
+        if flock is None or lock_ex is None or lock_nb is None:
+            self.log("WARN", "fcntl flock not available on this platform; skipping single-instance lock")
+            return
+
         lock_file = "/tmp/gostorm-tv-sync.lock"
         pid_file = "/tmp/gostorm-tv-sync.pid"
 
@@ -1532,7 +1561,7 @@ class GoStormTV:
 
         # Try to acquire EXCLUSIVE lock (non-blocking)
         try:
-            fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(self._lock_fd.fileno(), lock_ex | lock_nb)
         except IOError:
             # Lock held by another process - check if it's alive
             try:
@@ -1545,7 +1574,7 @@ class GoStormTV:
             except (ProcessLookupError, ValueError, FileNotFoundError, PermissionError):
                 # Stale lock - old process crashed
                 self.log("WARN", "Stale lock detected, forcing acquisition...")
-                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX)
+                flock(self._lock_fd.fileno(), lock_ex)
 
         # Write our PID
         try:
@@ -1560,13 +1589,16 @@ class GoStormTV:
     def _release_lock(self):
         """Release lock file on exit."""
         import fcntl
+        flock = getattr(fcntl, 'flock', None)
+        lock_un = getattr(fcntl, 'LOCK_UN', None)
 
         lock_file = "/tmp/gostorm-tv-sync.lock"
         pid_file = "/tmp/gostorm-tv-sync.pid"
 
         try:
             if hasattr(self, '_lock_fd') and self._lock_fd:
-                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
+                if flock is not None and lock_un is not None:
+                    flock(self._lock_fd.fileno(), lock_un)
                 self._lock_fd.close()
                 self._lock_fd = None
         except:
@@ -1595,10 +1627,14 @@ class GoStormTV:
         self.log("INFO", "=" * 60)
 
         try:
-            # Protect existing files from cleanup (for shows now filtered by age/genre)
-            self._populate_registry_from_existing()
-
             request_ids_env = (os.getenv('GOSTREAM_REQUEST_TV_TMDB_IDS') or '').strip()
+            request_only_mode = bool(request_ids_env)
+            if not request_only_mode:
+                # Protect existing files from cleanup (for shows now filtered by age/genre)
+                self._populate_registry_from_existing()
+            else:
+                self.log("INFO", "Request-only mode: skipping full registry population scan")
+
             if request_ids_env:
                 raw_ids = [x.strip() for x in request_ids_env.split(',') if x.strip()]
                 ids: List[int] = []
@@ -1648,20 +1684,23 @@ class GoStormTV:
 
                 name = show.get('name') or show.get('original_name', '')
                 self.log("INFO", f"[{i}/{len(shows)}] {name}")
-                self.process_show(show)
+                self.process_show(show, force_reprocess=request_only_mode)
 
             # Save registry
             self._save_registry()
             self.log("INFO", "Registry saved")
 
-            # Cleanup
-            self.log("INFO", "Running cleanup...")
-            self.cleanup_orphaned_files()
-            self.cleanup_orphaned_torrents()
+            if not request_only_mode:
+                # Cleanup
+                self.log("INFO", "Running cleanup...")
+                self.cleanup_orphaned_files()
+                self.cleanup_orphaned_torrents()
 
-            # Rehydrate missing torrents (re-add from saved magnets)
-            self.log("INFO", "Checking for torrents to rehydrate...")
-            self.rehydrate_missing_torrents()
+                # Rehydrate missing torrents (re-add from saved magnets)
+                self.log("INFO", "Checking for torrents to rehydrate...")
+                self.rehydrate_missing_torrents()
+            else:
+                self.log("INFO", "Request-only mode: skipping cleanup and rehydrate scans")
 
             # Stats
             elapsed = time.time() - start_time
