@@ -67,6 +67,12 @@ def _env_truthy(value: object) -> bool:
 
 
 def _normalize_plex_url(url: str) -> str:
+    url = (url or '').strip().rstrip('/')
+    if not url:
+        url = 'http://127.0.0.1:32400'
+    # In-container scripts must talk to Plex on the internal port, not mapped host port.
+    if re.match(r'^https?://(localhost|127\.0\.0\.1):32302$', url, re.IGNORECASE):
+        url = 'http://127.0.0.1:32400'
     if PLEX_INSECURE_TLS and url.startswith('http://') and ':32400' in url:
         return 'https://' + url[len('http://'):]
     return url
