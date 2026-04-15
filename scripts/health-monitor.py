@@ -736,38 +736,6 @@ def get_clean_title_from_mkv(torrent_hash: str) -> Optional[str]:
     return mkv_title_cache.get(torrent_hash)
 
 
-def search_plex_by_filename(filename: str) -> Optional[Dict[str, Any]]:
-    """Search Plex library for a specific filename to get metadata (V238: TV Support)."""
-    try:
-        url = f"{PLEX_URL}/library/sections/all/search?filename={filename}&X-Plex-Token={PLEX_TOKEN}"
-        response = plex_get(url, timeout=5)
-        if response.status_code == 200:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(response.text)
-            video = root.find('.//Video')
-            if video is not None:
-                # Use grandparentThumb for TV Shows, thumb for Movies
-                thumb = video.get('grandparentThumb') or video.get('thumb')
-                title = video.get('title')
-                
-                # If it's an episode, construct a better display title
-                if video.get('type') == 'episode':
-                    show = video.get('grandparentTitle', '')
-                    s = video.get('parentIndex', '')
-                    e = video.get('index', '')
-                    if show:
-                        title = f"{show} S{s}E{e}"
-                
-                return {
-                    'title': title,
-                    'year': video.get('year'),
-                    'poster': f"{PLEX_URL}{thumb}?X-Plex-Token={PLEX_TOKEN}" if thumb else None
-                }
-    except Exception as e:
-        logger.debug(f"Plex filename search failed for {filename}: {e}")
-    return None
-
-
 def get_torrent_files(torrent_hash: str) -> List[str]:
     """Fetch file list for a torrent from GoStorm API."""
     try:
@@ -1445,6 +1413,34 @@ def trigger_preload(file_path: Path) -> bool:
         logger.error(f"Smart Preload: Failed to trigger via API: {e}")
         return False
 
+
+def find_next_episode(show_title: str, season: int, episode: int, current_file_path: Optional[str] = None) -> Optional[Tuple[Path, str]]:
+    """Find the next episode file in the same folder using common episode patterns."""
+    next_season = season
+    next_episode_num = episode + 1
+
+    if current_file_path:
+        base_path = Path(current_file_path).parent
+    else:
+        base_path = Path(TV_DIR)
+
+    patterns = [
+        re.compile(rf"(?i)s{next_season:02d}e{next_episode_num:02d}"),
+        re.compile(rf"(?i){next_season}x{next_episode_num:02d}"),
+    ]
+
+    try:
+        if base_path.exists():
+            for ext in ("*.mkv", "*.mp4", "*.avi", "*.m4v", "*.ts"):
+                for candidate in sorted(base_path.glob(ext)):
+                    name = candidate.name
+                    if any(p.search(name) for p in patterns):
+                        return candidate, f"{show_title} S{next_season:02d}E{next_episode_num:02d}"
+    except Exception as e:
+        logger.debug(f"Smart Preload: next episode lookup failed: {e}")
+
+    return None
+
 def handle_plex_event(payload: Dict) -> None:
     """Handle Plex webhook event."""
     event = payload.get('event')
@@ -1568,7 +1564,14 @@ def stop_sync() -> Dict[str, Any]:
         logger.info("Sync stopped by user")
         return {"status": "ok", "message": "Sync stopped"}
     except subprocess.TimeoutExpired:
-        sync_state["process"].kill()
+        process = sync_state.get("process")
+        if process is not None:
+            process.kill()
+        sync_state["running"] = False
+        sync_state["process"] = None
+        sync_state["pid"] = None
+        sync_state["started_at"] = None
+        sync_state["last_status"] = "killed"
         return {"status": "ok", "message": "Sync killed"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1640,7 +1643,14 @@ def stop_tv_sync() -> Dict[str, Any]:
         logger.info("TV Sync stopped by user")
         return {"status": "ok", "message": "TV Sync stopped"}
     except subprocess.TimeoutExpired:
-        tv_sync_state["process"].kill()
+        process = tv_sync_state.get("process")
+        if process is not None:
+            process.kill()
+        tv_sync_state["running"] = False
+        tv_sync_state["process"] = None
+        tv_sync_state["pid"] = None
+        tv_sync_state["started_at"] = None
+        tv_sync_state["last_status"] = "killed"
         return {"status": "ok", "message": "TV Sync killed"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1707,7 +1717,14 @@ def stop_watchlist_sync() -> Dict[str, Any]:
         logger.info("Watchlist Sync stopped by user")
         return {"status": "ok", "message": "Watchlist Sync stopped"}
     except subprocess.TimeoutExpired:
-        watchlist_sync_state["process"].kill()
+        process = watchlist_sync_state.get("process")
+        if process is not None:
+            process.kill()
+        watchlist_sync_state["running"] = False
+        watchlist_sync_state["process"] = None
+        watchlist_sync_state["pid"] = None
+        watchlist_sync_state["started_at"] = None
+        watchlist_sync_state["last_status"] = "killed"
         return {"status": "ok", "message": "Watchlist Sync killed"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
